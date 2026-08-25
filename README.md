@@ -133,7 +133,7 @@ $XDG_DATA_HOME/reindr/templates/opencode-controller.html
 
 The tracked source assets are [`templates/reindr-loading.html`](templates/reindr-loading.html) and [`templates/opencode-controller.html`](templates/opencode-controller.html). On startup, Reindr copies them into the user data directory when no saved template exists. When `XDG_DATA_HOME` is unset, these resolve under `~/.local/share/reindr/templates`. Reindr never overwrites customized templates and reads the selected saved copy each time `reindr_open` creates a session UI.
 
-Use `{{sessionTitle}}` where the escaped OpenCode session title should appear. Additional `.html` files saved in the templates directory appear as clickable items under the landing page's **Templates** tab. Clicking one opens a sandboxed, read-only preview; controller mutations are disabled until the template is used by a real session.
+Use `{{sessionTitle}}` where the escaped OpenCode session title should appear. Additional `.html` files saved in the templates directory appear as clickable items under the authenticated landing page's **Templates** tab. Clicking one opens a sandboxed, read-only preview; controller mutations are disabled until the unmodified built-in controller is used by a real session.
 
 `opencode-controller.html` is the default for new session UIs. It provides next-turn agent/model selection, reasoning visibility, prompt and command controls, abort, live status, message history, tool visualization, and child-session/subagent visualization. Use the minimal loading view explicitly with `reindr_open({ template: "reindr-loading.html" })`.
 
@@ -193,30 +193,35 @@ Environment variables override plugin options.
 ## Security Model
 
 - The panel binds only to `127.0.0.1`.
-- Each panel process has a random capability token covering its active sessions. Cross-process navigation uses loopback URLs advertised through the Reindr process registry.
+- Each panel process has a random bearer capability covering its active sessions. Unauthenticated landing pages do not expose session metadata, template names, or capability URLs. Cross-process navigation uses loopback URLs advertised through the Reindr process registry.
 - WebSocket upgrades also require the exact panel `Origin`.
-- Session document routes use separate read-only tokens, so generated code never receives the WebSocket capability.
+- WebSocket upgrades for session pages are accepted only for a currently registered local canvas.
+- Session and template document routes use separate read-only capabilities, so generated code never receives the WebSocket capability. Template-frame capabilities expire after five minutes and are bounded in memory.
 - The trusted shell uses a nonce-based CSP and cannot be framed.
 - Generated content uses `sandbox="allow-scripts allow-forms"` without `allow-same-origin`.
 - The generated-content CSP blocks network connections, form actions, nested frames, objects, and base URL changes.
 - Configured HTTPS hosts can serve scripts, styles, images, and fonts, but `fetch`, WebSocket, and form submission remain blocked.
 - The trusted bridge communicates over a private `MessageChannel`; arbitrary generated scripts cannot forge privileged shell messages with `parent.postMessage`.
 - `opencode.submit()` is accepted only synchronously inside a trusted click or form-submission event.
-- Controller prompts, commands, and aborts are accepted only synchronously inside a trusted click or form-submission event and are restricted to the owning session.
-- Interaction payloads, pending interactions, and file sizes are bounded.
+- Controller RPC is available only while the canvas bytes exactly match the shipped controller. Prompts, commands, and aborts are accepted by the bridge only synchronously inside a trusted click or form-submission event and are restricted to the owning session.
+- Interaction payloads, pending interactions, controller snapshots, open preview capabilities, and file reads are bounded. Session dispatch is serialized so commands cannot race queued prompts.
 
 Allowlisted hosts are trusted code suppliers. A script loaded from an allowed host runs inside the generated-content sandbox and can influence what the interface displays or submits after a user action.
 
 Generated JavaScript can still consume CPU or create a misleading interface inside its iframe. User activation, sandboxing, CSP, and the private bridge reduce its authority but do not make arbitrary code harmless.
 
+The panel URL is a bearer credential and is exposed to the owning OpenCode session through tool output and `REINDR_UI_URL`. Browser activation protects against generated iframe code invoking mutations on its own; it is not cryptographic attestation against another local process that has stolen the full panel bearer. Treat panel URLs as secrets.
+
 The CSP blocks `fetch`, WebSocket, form submission, and similar connection APIs. Browser sandboxing does not reliably prevent generated code from navigating its own iframe to an external URL; such navigation can make an outbound request, destroys access to the private bridge, and replaces the generated interface. Do not render untrusted secrets into the canvas.
 
 ## Routes
 
-- `/`, stale session URLs, and unknown page routes show a static Reindr landing page when no matching UI is available. Its side navigation has **Sessions** and **Templates** tabs for running sessions and saved template names without embedding document content or opening a panel connection.
+- `/`, unauthenticated stale session URLs, and unknown page routes show a static Reindr landing page without session or template metadata.
+- `/?view=sessions&token=...` and `/?view=templates&token=...` show the authenticated session and template catalogs.
 - `/?token=...` redirects to the most recently updated session UI, or waits for initial content.
 - `/s/<session-id>?token=...` displays one active session and lets the drawer navigate to other registered sessions.
 - `/frame/<session-key>?token=...` serves the sandboxed session HTML with a limited read token.
+- `/template-frame/<name>?token=...` serves a sandboxed template with a short-lived, template-specific read capability.
 - `/ws?token=...` carries live updates and interactions.
 
 Capability URLs expire when the OpenCode process exits. The current URL is reinjected into agent instructions and `REINDR_UI_URL` after restart.

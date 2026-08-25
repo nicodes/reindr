@@ -115,7 +115,10 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   const panelURL = new URL(environment.REINDR_UI_URL)
   await waitForHTTP(panelURL.href)
   const landingPage = await browser.newPage()
-  await landingPage.goto(panelURL.origin)
+  const landingURL = new URL("/", panelURL)
+  landingURL.search = panelURL.search
+  landingURL.searchParams.set("view", "sessions")
+  await landingPage.goto(landingURL.href)
   await landingPage.getByRole("heading", { name: "Reindr" }).waitFor()
   assert.equal(await landingPage.getByText("Start a session to get started.").count(), 1)
   assert.equal(await landingPage.getByRole("navigation", { name: "Running Reindr sessions" }).getByRole("link").count(), 2)
@@ -134,6 +137,7 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   await landingPage.getByRole("link", { name: "Back to templates" }).click()
   await landingPage.getByRole("tab", { name: "Sessions" }).click()
   const staleURL = new URL("/s/missing-session", panelURL)
+  staleURL.search = panelURL.search
   await landingPage.goto(staleURL.href)
   await landingPage.getByRole("heading", { name: "Reindr" }).waitFor()
   await landingPage.getByRole("link", { name: /Session browser-session/ }).click()
@@ -153,6 +157,7 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   await writeFile(environment.REINDR_UI_FILE, canvasHTML("Original summary"))
   await notifyFileEdit(hooks, "browser-session")
   await frame.getByText("Original summary").waitFor()
+  assert.equal(await frame.locator("body").evaluate(() => Boolean((window as any).opencode.controller)), false, "custom canvases do not receive controller RPC")
   await new Promise((resolve) => setTimeout(resolve, 500))
   assert.equal(fake.prompts.length, 0, "page-load and forged submissions are blocked")
   assert.equal(await page.locator(".card, .bar, .rail").count(), 0, "the shell adds no content chrome")
