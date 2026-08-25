@@ -131,7 +131,7 @@ $XDG_DATA_HOME/reindr/templates/reindr-loading.html
 $XDG_DATA_HOME/reindr/templates/opencode-controller.html
 ```
 
-When `XDG_DATA_HOME` is unset, these resolve under `~/.local/share/reindr/templates`. Reindr never overwrites an existing template and reads the selected template each time `reindr_open` creates a session UI.
+The tracked source assets are [`templates/reindr-loading.html`](templates/reindr-loading.html) and [`templates/opencode-controller.html`](templates/opencode-controller.html). On startup, Reindr copies them into the user data directory when no saved template exists. When `XDG_DATA_HOME` is unset, these resolve under `~/.local/share/reindr/templates`. Reindr never overwrites customized templates and reads the selected saved copy each time `reindr_open` creates a session UI.
 
 Use `{{sessionTitle}}` where the escaped OpenCode session title should appear. Additional `.html` files saved in the templates directory appear as clickable items under the landing page's **Templates** tab. Clicking one opens a sandboxed, read-only preview; controller mutations are disabled until the template is used by a real session.
 
@@ -141,7 +141,7 @@ OpenCode 1.18.22 does not expose a public v1 API for persistent session agent/mo
 
 ## Tailwind And Shared Styling
 
-The shipped templates use Tailwind CSS 4 utilities without a browser runtime or CDN dependency. `npm run build:tailwind` scans the template strings in `.opencode/plugins/reindr.ts` and writes the minified, content-scoped stylesheet to `.opencode/reindr-tailwind.css`. Reindr embeds that generated stylesheet in each sandboxed frame.
+The shipped templates use Tailwind CSS 4 utilities without a browser runtime or CDN dependency. `npm run build:tailwind` scans `templates/*.html` plus dynamic utility strings in `.opencode/plugins/reindr.ts` and writes the minified, content-scoped stylesheet to `.opencode/reindr-tailwind.css`. Reindr embeds that generated stylesheet in each sandboxed frame.
 
 The generated document also receives a small neutral base stylesheet before Tailwind. It supplies dark defaults and reusable tokens such as `--ui-bg`, `--ui-surface`, `--ui-text`, and `--ui-accent` for session HTML that does not use utilities.
 
