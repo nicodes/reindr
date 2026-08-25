@@ -104,6 +104,8 @@ const MAX_PENDING_SUBMISSIONS = 100
 const REGISTRY_HEARTBEAT_MS = 3_000
 const REGISTRY_STALE_MS = 10_000
 const BUILT_IN_TAILWIND_STYLESHEET = new URL("../reindr-tailwind.css", import.meta.url)
+const BUILT_IN_LOADING_TEMPLATE = new URL("../../templates/reindr-loading.html", import.meta.url)
+const BUILT_IN_CONTROLLER_TEMPLATE = new URL("../../templates/opencode-controller.html", import.meta.url)
 
 function booleanOption(value: unknown, fallback: boolean) {
   if (typeof value === "boolean") return value
@@ -291,7 +293,7 @@ function escapeHTML(value: string) {
     .replaceAll("'", "&#39;")
 }
 
-const DEFAULT_LOADING_TEMPLATE = `<!doctype html>
+const FALLBACK_LOADING_TEMPLATE = `<!doctype html>
 <!-- reindr-template:reindr-loading version=2 -->
 <html lang="en" class="min-h-full bg-[#080808] text-zinc-100">
 <head>
@@ -314,7 +316,7 @@ const DEFAULT_LOADING_TEMPLATE = `<!doctype html>
 </body>
 </html>`
 
-const DEFAULT_CONTROLLER_TEMPLATE = `<!doctype html>
+const FALLBACK_CONTROLLER_TEMPLATE = `<!doctype html>
 <!-- reindr-template:opencode-controller version=4 -->
 <html lang="en" class="h-full overflow-hidden bg-[#090a0c] text-[#f1f3f7]">
 <head>
@@ -1273,6 +1275,24 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: "reindr", level, message, extra } }).catch(() => {})
 
+  const loadBuiltInTemplate = async (file: URL, fallback: string, name: string) => {
+    try {
+      const info = await stat(file)
+      if (!info.isFile() || info.size > MAX_TEMPLATE_BYTES) throw new Error(`template exceeds ${MAX_TEMPLATE_BYTES} bytes`)
+      const template = await readFile(file, "utf8")
+      if (!template.trim()) throw new Error("template cannot be empty")
+      return template
+    } catch (error) {
+      log("warn", "failed to load tracked built-in template; using embedded fallback", { name, error: String(error) })
+      return fallback
+    }
+  }
+
+  const [defaultLoadingTemplate, defaultControllerTemplate] = await Promise.all([
+    loadBuiltInTemplate(BUILT_IN_LOADING_TEMPLATE, FALLBACK_LOADING_TEMPLATE, "reindr-loading.html"),
+    loadBuiltInTemplate(BUILT_IN_CONTROLLER_TEMPLATE, FALLBACK_CONTROLLER_TEMPLATE, "opencode-controller.html"),
+  ])
+
   const canvasFile = (sessionID: string) => path.join(config.canvasDirectory, canvasFileName(sessionID))
 
   const sessionFrameKey = (sessionID: string) =>
@@ -1393,9 +1413,9 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       const existing = await handle.readFile("utf8")
       const digest = createHash("sha256").update(existing).digest("hex")
       const replacementText = LEGACY_CONTROLLER_HASHES.has(digest)
-        ? DEFAULT_CONTROLLER_TEMPLATE
+        ? defaultControllerTemplate
         : LEGACY_LOADING_HASHES.has(digest)
-          ? DEFAULT_LOADING_TEMPLATE
+          ? defaultLoadingTemplate
           : null
       if (!replacementText) return false
       const replacement = Buffer.from(replacementText, "utf8")
@@ -1534,7 +1554,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     } catch (error) {
       if (name === "reindr-loading.html") {
         log("warn", "failed to load saved loading template; using the built-in default", { file, error: String(error) })
-        return DEFAULT_LOADING_TEMPLATE
+        return defaultLoadingTemplate
       }
       throw error
     }
@@ -1617,8 +1637,8 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     mkdir(config.templateDirectory, { recursive: true, mode: 0o700 }),
   ])
   await Promise.all([
-    ensureTemplate(loadingTemplateFile, DEFAULT_LOADING_TEMPLATE),
-    ensureTemplate(controllerTemplateFile, DEFAULT_CONTROLLER_TEMPLATE),
+    ensureTemplate(loadingTemplateFile, defaultLoadingTemplate),
+    ensureTemplate(controllerTemplateFile, defaultControllerTemplate),
   ])
   await Promise.all([
     migrateKnownBuiltInTemplate(loadingTemplateFile),

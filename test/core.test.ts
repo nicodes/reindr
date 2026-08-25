@@ -213,6 +213,8 @@ test("the same session reuses its global UI file across worktrees", async (t) =>
   const loadingTemplateFile = path.join(dataDirectory, "reindr", "templates", "reindr-loading.html")
   const controllerTemplateFile = path.join(dataDirectory, "reindr", "templates", "opencode-controller.html")
   assert.equal(firstEnvironment.REINDR_UI_FILE, expectedFile)
+  assert.equal(await readFile(loadingTemplateFile, "utf8"), await readFile(path.join(process.cwd(), "templates", "reindr-loading.html"), "utf8"))
+  assert.equal(await readFile(controllerTemplateFile, "utf8"), await readFile(path.join(process.cwd(), "templates", "opencode-controller.html"), "utf8"))
   assert.match(await readFile(loadingTemplateFile, "utf8"), /Preparing your interface[\s\S]*\{\{sessionTitle\}\}/)
   assert.match(await readFile(controllerTemplateFile, "utf8"), /OpenCode controller[\s\S]*opencode\.controller/)
   assert.doesNotMatch(await readFile(loadingTemplateFile, "utf8"), /<style>/)

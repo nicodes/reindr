@@ -1,0 +1,164 @@
+<!doctype html>
+<!-- reindr-template:opencode-controller version=4 -->
+<html lang="en" class="h-full overflow-hidden bg-[#090a0c] text-[#f1f3f7]">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>OpenCode Controller</title>
+</head>
+<body class="m-0 h-full overflow-hidden bg-[#090a0c] text-[#f1f3f7] [font-family:Inter,ui-sans-serif,system-ui,sans-serif]">
+  <header class="sticky top-0 z-5 flex min-h-14 items-center gap-3 border-b border-[#20232a] bg-[#090a0ce8] px-3.5 py-[9px] backdrop-blur-[18px]">
+    <span class="text-[11px] font-bold tracking-[.16em] uppercase">OpenCode controller</span>
+    <strong id="session-title" class="min-w-0 overflow-hidden text-sm font-semibold text-ellipsis whitespace-nowrap">Loading session</strong>
+    <span id="status" class="ml-auto rounded-full border border-[#282c35] bg-[#11141a] px-2 py-1 text-[11px] text-[#8c929f]">connecting</span>
+    <button id="refresh" class="cursor-pointer rounded-lg border border-[#282c35] bg-[#171a20] px-[11px] py-2 hover:border-[#444b58] disabled:cursor-wait disabled:opacity-50" type="button">Refresh</button>
+    <button id="abort" class="cursor-pointer rounded-lg border border-[#282c35] bg-[#171a20] px-[11px] py-2 hover:border-[#444b58] disabled:cursor-wait disabled:opacity-50" type="button">Abort</button>
+  </header>
+  <div class="grid h-[calc(100dvh-56px)] min-h-0 grid-cols-[280px_minmax(0,1fr)] overflow-hidden max-[760px]:grid-cols-1 max-[760px]:grid-rows-[auto_minmax(0,1fr)]">
+    <aside class="min-h-0 overflow-y-auto border-r border-[#20232a] bg-[#0f1115] p-3.5 max-[760px]:max-h-[38dvh] max-[760px]:border-r-0 max-[760px]:border-b">
+      <section class="border-b border-[#20232a] pb-4">
+        <h2 class="mb-2.5 text-[10px] font-bold tracking-[.14em] text-[#8c929f] uppercase">Next turn</h2>
+        <label class="mt-[9px] grid gap-[5px] text-[11px] text-[#8c929f]">Agent / mode<select id="agent" class="w-full rounded-lg border border-[#282c35] bg-[#171a20] px-2.5 py-[9px] text-[#f1f3f7]"></select></label>
+        <label class="mt-[9px] grid gap-[5px] text-[11px] text-[#8c929f]">Model<select id="model" class="w-full rounded-lg border border-[#282c35] bg-[#171a20] px-2.5 py-[9px] text-[#f1f3f7]"></select></label>
+        <label class="mt-[9px] flex items-center gap-2 text-[11px] text-[#8c929f]"><input id="thinking" class="size-auto" type="checkbox"> Show reasoning</label>
+      </section>
+      <section class="border-b border-[#20232a] py-3 pb-4">
+        <h2 class="mb-2.5 text-[10px] font-bold tracking-[.14em] text-[#8c929f] uppercase">Commands</h2>
+        <label class="mt-[9px] grid gap-[5px] text-[11px] text-[#8c929f]">Command<select id="command" class="w-full rounded-lg border border-[#282c35] bg-[#171a20] px-2.5 py-[9px] text-[#f1f3f7]"></select></label>
+        <div class="mt-[7px] grid grid-cols-[1fr_auto] gap-[7px]"><input id="arguments" class="w-full rounded-lg border border-[#282c35] bg-[#171a20] px-2.5 py-[9px] text-[#f1f3f7]" placeholder="Arguments"><button id="run-command" class="cursor-pointer rounded-lg border border-[#282c35] bg-[#171a20] px-[11px] py-2 hover:border-[#444b58]" type="button">Run</button></div>
+      </section>
+      <section class="border-b border-[#20232a] py-3 pb-4">
+        <h2 class="mb-2.5 text-[10px] font-bold tracking-[.14em] text-[#8c929f] uppercase">Subagents</h2>
+        <div id="children" class="grid gap-1.5"><span class="text-[11px] text-[#8c929f]">No child sessions</span></div>
+      </section>
+    </aside>
+    <main class="min-h-0 min-w-0 overflow-y-auto px-[18px] pt-[18px] pb-[190px] max-[760px]:px-2.5">
+      <div id="error" class="mb-3 rounded-lg border border-[#6b302d] bg-[#351b1a] px-3 py-2.5 text-xs text-[#ffd6d2]" role="alert" hidden></div>
+      <div id="history" class="mx-auto grid max-w-[980px] gap-3" aria-live="polite"></div>
+    </main>
+  </div>
+  <div class="fixed right-0 bottom-0 left-[280px] z-4 bg-[linear-gradient(transparent,#090a0c_20%)] px-[18px] pt-3 pb-4 max-[760px]:left-0">
+    <form id="prompt-form" class="mx-auto mt-7 grid max-w-[980px] grid-cols-[1fr_auto] gap-2 rounded-xl border border-[#303641] bg-[#11141a] p-2 shadow-[0_18px_55px_#000b]"><textarea id="prompt" class="min-h-12 max-h-40 w-full resize-y border-0 bg-transparent px-2.5 py-[9px] text-[#f1f3f7] outline-none" required placeholder="Send the next instruction..."></textarea><button class="self-end cursor-pointer rounded-lg border border-[#9ee6c2] bg-[#9ee6c2] px-[11px] py-2 font-bold text-[#07110c]" type="submit">Send</button></form>
+  </div>
+  <dialog id="abort-confirm" class="w-[min(420px,calc(100vw-32px))] rounded-xl border border-[#303641] bg-[#11141a] p-0 text-[#f1f3f7] shadow-[0_24px_80px_#000e] backdrop:bg-black/70 backdrop:backdrop-blur-[3px]">
+    <form class="p-[18px]" method="dialog">
+      <h2 class="text-[15px] font-bold">Abort active turn?</h2>
+      <p class="mt-2 mb-[18px] text-xs text-[#8c929f]">This stops the current OpenCode response for this session.</p>
+      <div class="flex justify-end gap-2"><button class="cursor-pointer rounded-lg border border-[#282c35] bg-[#171a20] px-[11px] py-2 hover:border-[#444b58]" value="cancel">Keep running</button><button id="confirm-abort" class="cursor-pointer rounded-lg border border-[#8d403b] bg-[#6b302d] px-[11px] py-2 text-white" type="button">Abort turn</button></div>
+    </form>
+  </dialog>
+  <script>
+  (function () {
+    var api = window.opencode && window.opencode.controller;
+    if (window.opencode) {
+      if (window.opencode.fillViewport) window.opencode.fillViewport();
+      window.opencode.setHeight(120);
+    }
+    var state = null;
+    var busy = false;
+    var sessionTitle = document.getElementById("session-title");
+    var status = document.getElementById("status");
+    var history = document.getElementById("history");
+    var children = document.getElementById("children");
+    var agent = document.getElementById("agent");
+    var model = document.getElementById("model");
+    var thinking = document.getElementById("thinking");
+    var command = document.getElementById("command");
+    var argumentsInput = document.getElementById("arguments");
+    var promptInput = document.getElementById("prompt");
+    var errorBox = document.getElementById("error");
+    var abortDialog = document.getElementById("abort-confirm");
+    function text(value) { return value == null ? "" : String(value); }
+    function showError(error) { errorBox.textContent = text(error && error.message || error); errorBox.hidden = false; }
+    function clearError() { errorBox.textContent = ""; errorBox.hidden = true; }
+    function el(tag, className, value) { var node = document.createElement(tag); if (className) node.className = className; if (value != null) node.textContent = text(value); return node; }
+    function time(value) { var stamp = value && (value.created || value.start); return stamp ? new Date(stamp).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) : ""; }
+    function selectedModel() { var pieces = model.value.split("/"); return pieces.length > 1 ? { providerID: pieces.shift(), modelID: pieces.join("/") } : {}; }
+    function selection() { var picked = selectedModel(); return { agent: agent.value, providerID: picked.providerID || "", modelID: picked.modelID || "" }; }
+    function fillSelect(select, items, current, label) {
+      var before = select.value || current;
+      select.replaceChildren();
+      var fallback = document.createElement("option"); fallback.value = ""; fallback.textContent = label; select.appendChild(fallback);
+      items.forEach(function (item) { var option = document.createElement("option"); option.value = item.value; option.textContent = item.label; option.disabled = item.disabled; select.appendChild(option); });
+      select.value = items.some(function (item) { return item.value === before; }) ? before : current || "";
+    }
+    function renderControls() {
+      var agents = (state.agents || []).map(function (item) { return { value: item.name, label: item.name + " [" + item.mode + "]" }; });
+      fillSelect(agent, agents, state.selection && state.selection.agent, "Default agent");
+      var models = [];
+      (state.providers || []).forEach(function (provider) { (provider.models || []).forEach(function (item) { models.push({ value: provider.id + "/" + item.id, label: provider.name + " / " + item.name + (item.reasoning ? " [reasoning]" : ""), disabled: !provider.connected }); }); });
+      var currentModel = state.selection && state.selection.model ? state.selection.model.providerID + "/" + state.selection.model.modelID : "";
+      fillSelect(model, models, currentModel === "/" ? "" : currentModel, "Default model");
+      fillSelect(command, (state.commands || []).map(function (item) { return { value: item.name, label: "/" + item.name + (item.subtask ? " [subtask]" : "") }; }), command.value, "Select command");
+    }
+    function renderChildren() {
+      children.replaceChildren();
+      if (!(state.children || []).length) { children.appendChild(el("span", "text-[11px] text-[#8c929f]", "No child sessions")); return; }
+      state.children.forEach(function (item) { var card = el("div", "rounded-lg border border-[#242832] bg-[#12151a] p-[9px]"); card.appendChild(el("strong", "block overflow-hidden text-xs text-ellipsis whitespace-nowrap", item.title)); card.appendChild(el("span", "mt-[3px] block overflow-hidden text-[10px] text-ellipsis whitespace-nowrap text-[#8c929f]", (item.status && item.status.type || "idle") + " | " + item.id)); children.appendChild(card); });
+    }
+    function renderPart(part) {
+      var detailsClasses = "rounded-lg border border-[#252a33] bg-[#12151a]";
+      var summaryClasses = "cursor-pointer px-2.5 py-[9px] text-[11px] font-semibold text-[#c8cdd7]";
+      var preClasses = "m-0 max-h-[360px] overflow-auto border-t border-[#252a33] p-2.5 font-mono text-[11px] leading-[1.55] whitespace-pre-wrap text-[#b9c0cc] [overflow-wrap:anywhere]";
+      if (part.type === "text") return el("p", "m-0 font-mono text-[13px] leading-[1.6] whitespace-pre-wrap [overflow-wrap:anywhere]", part.text);
+      if (part.type === "reasoning") { var reasoning = el("details", detailsClasses); reasoning.dataset.kind = "reasoning"; reasoning.open = thinking.checked; reasoning.appendChild(el("summary", summaryClasses + " text-[#b8a6dd]", "Reasoning / thinking")); reasoning.appendChild(el("pre", preClasses, part.text)); return reasoning; }
+      if (part.type === "tool") { var toolStatus = text(part.state && part.state.status); var tool = el("details", detailsClasses); tool.dataset.kind = "tool"; tool.dataset.status = toolStatus; var title = part.tool + " | " + toolStatus; var toolColor = toolStatus === "error" ? " text-[#ff786f]" : toolStatus === "running" || toolStatus === "pending" ? " text-[#f4bf75]" : ""; tool.appendChild(el("summary", summaryClasses + toolColor, title)); if (part.state && part.state.input) tool.appendChild(el("pre", preClasses, "Input\n" + part.state.input)); if (part.state && part.state.output) tool.appendChild(el("pre", preClasses, "Output\n" + part.state.output)); if (part.state && part.state.error) tool.appendChild(el("pre", preClasses, "Error\n" + part.state.error)); return tool; }
+      if (part.type === "subtask") { var subtask = el("div", "rounded-lg border border-[#294039] bg-[#111a18] p-2.5"); subtask.appendChild(el("strong", "block text-[11px] text-[#9ee6c2]", "Subagent: " + part.agent + " | " + part.description)); subtask.appendChild(el("p", "mt-[5px] mb-0 text-[11px] whitespace-pre-wrap text-[#b8c8c2]", part.prompt)); return subtask; }
+      if (part.type === "patch") return el("pre", preClasses, "Changed files\n" + (part.files || []).join("\n"));
+      if (part.type === "step-finish") return el("pre", preClasses, "Step finished: " + part.reason + " | cost " + text(part.cost));
+      if (part.type === "retry") return el("pre", preClasses, "Retry " + text(part.attempt) + ": " + part.error);
+      return null;
+    }
+    function renderHistory() {
+      history.replaceChildren();
+      if (!(state.messages || []).length) { history.appendChild(el("div", "px-5 py-[60px] text-center text-[#8c929f]", "No history yet. Send a prompt to begin.")); return; }
+      state.messages.forEach(function (message) {
+        var card = el("article", "overflow-hidden rounded-xl border bg-[#0f1115] " + (message.role === "user" ? "border-[#2b443a]" : "border-[#232730]"));
+        var head = el("div", "flex items-center gap-2.5 border-b border-[#22262e] bg-[#12151a] px-3 py-[9px] text-[10px] text-[#8c929f]");
+        head.appendChild(el("strong", "text-[11px] text-[#f1f3f7] uppercase", message.role));
+        head.appendChild(el("span", "", (message.agent || "default") + " | " + (message.model && message.model.modelID || "default model")));
+        if (message.tokens && message.role === "assistant") head.appendChild(el("span", "", "tokens " + text(message.tokens.output || 0) + " / reasoning " + text(message.tokens.reasoning || 0)));
+        head.appendChild(el("time", "ml-auto", time(message.time)));
+        card.appendChild(head);
+        var parts = el("div", "grid gap-2.5 p-3");
+        (message.parts || []).forEach(function (part) { var node = renderPart(part); if (node) parts.appendChild(node); });
+        if (message.error) parts.appendChild(el("pre", "m-0 max-h-[360px] overflow-auto border-t border-[#252a33] p-2.5 font-mono text-[11px] leading-[1.55] whitespace-pre-wrap text-[#b9c0cc] [overflow-wrap:anywhere]", "Error\n" + message.error));
+        card.appendChild(parts); history.appendChild(card);
+      });
+    }
+    function render() {
+      sessionTitle.textContent = state.session && state.session.title || "OpenCode session";
+      var statusType = state.status && state.status.type || "unknown"; status.textContent = statusType; status.className = "ml-auto rounded-full border border-[#282c35] bg-[#11141a] px-2 py-1 text-[11px] " + (statusType === "busy" || statusType === "retry" ? "text-[#f4bf75]" : "text-[#8c929f]");
+      renderControls(); renderChildren(); renderHistory();
+    }
+    async function refresh() {
+      if (!api || busy) return;
+      busy = true;
+      try { state = await api.snapshot(); clearError(); render(); }
+      catch (error) { showError(error); }
+      finally { busy = false; }
+    }
+    document.getElementById("refresh").addEventListener("click", refresh);
+    thinking.addEventListener("change", renderHistory);
+    promptInput.addEventListener("keydown", function (event) {
+      if (event.key === "Enter" && !event.shiftKey && !event.isComposing) { event.preventDefault(); event.currentTarget.form.requestSubmit(); }
+    });
+    document.getElementById("prompt-form").addEventListener("submit", async function (event) {
+      event.preventDefault(); clearError(); var value = promptInput.value.trim(); if (!value) return;
+      try { var request = api.prompt(Object.assign({ prompt: value }, selection())); await request; promptInput.value = ""; await refresh(); } catch (error) { showError(error); }
+    });
+    document.getElementById("run-command").addEventListener("click", async function () {
+      if (!command.value) return; clearError();
+      try { var request = api.command(Object.assign({ command: command.value, arguments: argumentsInput.value }, selection())); await request; argumentsInput.value = ""; await refresh(); } catch (error) { showError(error); }
+    });
+    document.getElementById("abort").addEventListener("click", function () { abortDialog.showModal(); });
+    document.getElementById("confirm-abort").addEventListener("click", async function () {
+      clearError();
+      try { var request = api.abort(); abortDialog.close(); await request; await refresh(); } catch (error) { showError(error); }
+    });
+    if (!api) showError("This OpenCode runtime does not expose the Reindr controller bridge.");
+    else { refresh(); setInterval(refresh, 2000); }
+  })();
+  </script>
+</body>
+</html>
