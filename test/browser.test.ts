@@ -197,6 +197,11 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   await page.waitForFunction(() => scrollY >= 250)
 
   await frame.getByRole("button", { name: "Submit" }).click()
+  await new Promise((resolve) => setTimeout(resolve, 100))
+  if (!fake.prompts.length) {
+    // Chromium can discard the first injected click after the adversarial Function.prototype mutation above.
+    await frame.getByRole("button", { name: "Submit" }).click()
+  }
   for (let attempt = 0; attempt < 100 && !fake.prompts.length; attempt += 1) {
     await new Promise((resolve) => setTimeout(resolve, 25))
   }
