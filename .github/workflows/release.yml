@@ -1,4 +1,4 @@
-name: Publish packages
+name: Release
 run-name: Publish ${{ inputs.target }} (dry run ${{ inputs.dry_run }})
 
 on:
