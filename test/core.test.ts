@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
 import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { request } from "node:http"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -91,27 +92,52 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   assert.match(landing.headers.get("content-security-policy") ?? "", /default-src 'none'/)
   const landingDocument = await landing.text()
   assert.match(landingDocument, /Reindr[\s\S]*Start a session to get started\./)
-  assert.match(landingDocument, /Session session-a/, "the landing page links session A")
-  assert.match(landingDocument, /Session session-b/, "the landing page links session B")
+  assert.doesNotMatch(landingDocument, /Session session-a|Session session-b|token=/, "the unauthenticated landing page exposes no bearer links or session metadata")
+  const authorizedLandingURL = new URL("/", panelURL)
+  authorizedLandingURL.search = panelURL.search
+  authorizedLandingURL.searchParams.set("view", "sessions")
+  const authorizedLanding = await fetch(authorizedLandingURL)
+  const authorizedLandingDocument = await authorizedLanding.text()
+  assert.match(authorizedLandingDocument, /Session session-a/, "the authenticated landing page links session A")
+  assert.match(authorizedLandingDocument, /Session session-b/, "the authenticated landing page links session B")
   const templatePreviewURL = new URL("/template/opencode-controller.html", panelURL)
   templatePreviewURL.search = panelURL.search
   const templatePreview = await fetch(templatePreviewURL)
   assert.equal(templatePreview.status, 200)
   assert.match(templatePreview.headers.get("content-security-policy") ?? "", /frame-src 'self'/)
-  assert.match(await templatePreview.text(), /Read-only preview[\s\S]*Template preview: opencode-controller\.html/)
+  const templatePreviewDocument = await templatePreview.text()
+  assert.match(templatePreviewDocument, /Read-only preview[\s\S]*Template preview: opencode-controller\.html/)
   const forbiddenTemplateFrame = await fetch(new URL("/template-frame/opencode-controller.html", panelURL))
   assert.equal(forbiddenTemplateFrame.status, 403)
-  const templateFrameURL = new URL("/template-frame/opencode-controller.html", panelURL)
-  templateFrameURL.search = panelURL.search
+  const frameURLMatch = templatePreviewDocument.match(/frame\.src = ("[^"]+")/)
+  assert.ok(frameURLMatch)
+  const templateFrameURL = new URL(JSON.parse(frameURLMatch[1]), panelURL)
+  assert.notEqual(templateFrameURL.searchParams.get("token"), panelURL.searchParams.get("token"), "template code receives only a narrow frame capability")
+  const mainTokenFrameURL = new URL("/template-frame/opencode-controller.html", panelURL)
+  mainTokenFrameURL.search = panelURL.search
+  assert.equal((await fetch(mainTokenFrameURL)).status, 403, "the panel bearer cannot be reused as a template-frame capability")
   const templateFrame = await fetch(templateFrameURL)
   assert.equal(templateFrame.status, 200)
+  assert.match(templateFrame.headers.get("content-security-policy") ?? "", /sandbox allow-scripts; frame-ancestors 'self'/)
   assert.match(await templateFrame.text(), /OpenCode controller[\s\S]*opencode\.controller/)
   const staleSession = await fetch(new URL("/s/missing-session", panelURL))
   assert.equal(staleSession.status, 200)
-  assert.match(await staleSession.text(), /Running Reindr sessions[\s\S]*Session session-a/)
+  assert.doesNotMatch(await staleSession.text(), /Session session-a/, "a stale unauthenticated URL does not enumerate sessions")
+  const authorizedStaleURL = new URL("/s/missing-session", panelURL)
+  authorizedStaleURL.search = panelURL.search
+  assert.match(await (await fetch(authorizedStaleURL)).text(), /Running Reindr sessions[\s\S]*Session session-a/)
   const unknownRoute = await fetch(`${panelURL.origin}/not-a-session`)
   assert.equal(unknownRoute.status, 200)
   assert.match(await unknownRoute.text(), /Start a session to get started\./)
+  const forgedHostStatus = await new Promise<number | undefined>((resolve, reject) => {
+    const forgedRequest = request({ hostname: panelURL.hostname, port: panelURL.port, path: "/", headers: { host: "attacker.invalid" } }, (response) => {
+      response.resume()
+      resolve(response.statusCode)
+    })
+    forgedRequest.on("error", reject)
+    forgedRequest.end()
+  })
+  assert.equal(forgedHostStatus, 403, "requests with a forged Host header are rejected")
   const panel = await waitForHTTP(panelURL.href)
   assert.equal(panel.status, 200)
   assert.equal(panel.headers.get("x-frame-options"), "DENY")
@@ -132,6 +158,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   const frameResponse = await fetch(new URL(canvas.frameURL, panelURL))
   assert.equal(frameResponse.status, 200)
   assert.match(frameResponse.headers.get("content-security-policy") ?? "", /connect-src 'none'/)
+  assert.match(frameResponse.headers.get("content-security-policy") ?? "", /sandbox allow-scripts allow-forms; frame-ancestors 'self'/)
   const frameDocument = await frameResponse.text()
   assert.match(frameDocument, /opencode/)
   assert.match(frameDocument, /tailwindcss v4/)
@@ -149,6 +176,24 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   assert.equal(crossSessionInit.canvases.length, 2, "the shared panel token can switch its active local session")
   crossSessionSocket.close()
 
+  const unknownSessionURL = new URL("/ws", panelURL)
+  unknownSessionURL.protocol = "ws:"
+  unknownSessionURL.search = panelURL.search
+  unknownSessionURL.searchParams.set("session", "unknown-session")
+  await assert.rejects(openSocket(unknownSessionURL.href, panelURL.origin), /403/)
+
+  socket.send(JSON.stringify({ type: "controller", id: "untrusted-snapshot", action: "snapshot", payload: {} }))
+  const deniedController = await nextMessage(socket, (message) => message.type === "controller-result" && message.id === "untrusted-snapshot")
+  assert.equal(deniedController.ok, false)
+  assert.match(deniedController.error, /unmodified built-in controller/)
+
+  let releaseStatus!: () => void
+  const statusGate = new Promise<void>((resolve) => { releaseStatus = resolve })
+  fake.client.session.status = async () => {
+    const snapshot = structuredClone(fake.statuses)
+    await statusGate
+    return { data: snapshot }
+  }
   const queuedPromise = nextMessage(socket, (message) => message.type === "submission-status" && message.status === "queued")
   socket.send(JSON.stringify({ type: "submit", prompt: "Apply settings", data: { dryRun: true } }))
   await queuedPromise
@@ -158,11 +203,34 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   fake.statuses["session-a"] = { type: "idle" }
   const sentPromise = nextMessage(socket, (message) => message.type === "submission-status" && message.status === "sent")
   await hooks.event?.({ event: { type: "session.status", properties: { sessionID: "session-a", status: { type: "idle" } } } as never })
+  releaseStatus()
   await sentPromise
   assert.equal(fake.prompts.length, 1)
   assert.equal(fake.prompts[0].path.id, "session-a")
   assert.match(fake.prompts[0].body.parts[0].text, /Apply settings/)
   assert.match(fake.prompts[0].body.parts[0].text, /dryRun/)
+
+  let releasePrompt!: () => void
+  const promptGate = new Promise<void>((resolve) => { releasePrompt = resolve })
+  fake.client.session.promptAsync = async (input: unknown) => {
+    fake.prompts.push(input)
+    await promptGate
+    return { data: undefined }
+  }
+  const firstRaceQueued = nextMessage(socket, (message) => message.type === "submission-status" && message.status === "queued")
+  socket.send(JSON.stringify({ type: "submit", prompt: "First serialized prompt" }))
+  await firstRaceQueued
+  const secondRaceQueued = nextMessage(socket, (message) => message.type === "submission-status" && message.status === "queued")
+  socket.send(JSON.stringify({ type: "submit", prompt: "Second serialized prompt" }))
+  await secondRaceQueued
+  await hooks.event?.({ event: { type: "session.status", properties: { sessionID: "session-a", status: { type: "idle" } } } as never })
+  for (let attempt = 0; attempt < 100 && fake.prompts.length < 2; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(fake.prompts.length, 2, "only the first queued prompt dispatches")
+  await hooks.event?.({ event: { type: "session.status", properties: { sessionID: "session-a", status: { type: "idle" } } } as never })
+  releasePrompt()
+  for (let attempt = 0; attempt < 100 && fake.prompts.length < 3; attempt += 1) await new Promise((resolve) => setTimeout(resolve, 10))
+  assert.equal(fake.prompts.length, 3, "an idle event received during dispatch wakes the remaining queue")
+  assert.match(fake.prompts[2].body.parts[0].text, /Second serialized prompt/)
 
   socket.close()
   await hooks.event?.({ event: { type: "session.deleted", properties: { info: { id: "session-b" } } } as never })

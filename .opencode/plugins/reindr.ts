@@ -1,7 +1,7 @@
 import { constants, watch, type FSWatcher } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
 import { spawn } from "node:child_process"
-import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
+import { chmod, mkdir, open, readdir, realpath, rename, rm, writeFile, type FileHandle } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
 import { tool, type Plugin, type PluginOptions } from "@opencode-ai/plugin"
@@ -11,7 +11,7 @@ type Canvas = {
   sessionTitle: string
   agent?: string
   html: string
-  file: string
+  trustedController: boolean
   createdAt: number
   updatedAt: number
   restored: boolean
@@ -61,7 +61,7 @@ type PanelServer = {
   stop(closeActiveConnections?: boolean): unknown
 }
 
-type ClientCanvas = Omit<Canvas, "html" | "file"> & {
+type ClientCanvas = Omit<Canvas, "html" | "trustedController"> & {
   frameURL: string
 }
 
@@ -100,7 +100,12 @@ const MAX_CANVAS_HTML_BYTES = 1_000_000
 const MAX_TEMPLATE_BYTES = 200_000
 const MAX_STYLESHEET_BYTES = 200_000
 const MAX_DATA_BYTES = 64_000
+const MAX_CONTROLLER_RESPONSE_BYTES = 1_000_000
+const MAX_CONTROLLER_HISTORY_BYTES = 650_000
+const MAX_CONTROLLER_MESSAGE_BYTES = 200_000
 const MAX_PENDING_SUBMISSIONS = 100
+const MAX_TEMPLATE_FRAME_CAPABILITIES = 100
+const TEMPLATE_FRAME_CAPABILITY_MS = 5 * 60_000
 const REGISTRY_HEARTBEAT_MS = 3_000
 const REGISTRY_STALE_MS = 10_000
 const BUILT_IN_TAILWIND_STYLESHEET = new URL("../reindr-tailwind.css", import.meta.url)
@@ -189,6 +194,30 @@ function jsonBytes(value: unknown) {
   return Buffer.byteLength(encoded, "utf8")
 }
 
+async function readBoundedHandle(handle: FileHandle, maximumBytes: number, label: string) {
+  const info = await handle.stat()
+  if (!info.isFile()) throw new Error(`${label} must be a regular file`)
+  if (info.size > maximumBytes) throw new Error(`${label} exceeds ${maximumBytes} bytes`)
+  const buffer = Buffer.alloc(maximumBytes + 1)
+  let offset = 0
+  while (offset < buffer.length) {
+    const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
+    if (!bytesRead) break
+    offset += bytesRead
+  }
+  if (offset > maximumBytes) throw new Error(`${label} exceeds ${maximumBytes} bytes`)
+  return buffer.subarray(0, offset).toString("utf8")
+}
+
+async function readBoundedFile(file: string | URL, maximumBytes: number, label: string) {
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    return await readBoundedHandle(handle, maximumBytes, label)
+  } finally {
+    await handle.close()
+  }
+}
+
 function sdkData<T>(response: unknown): T {
   if (response && typeof response === "object" && "error" in response && response.error) {
     throw new Error(String(response.error))
@@ -209,8 +238,36 @@ function limitedText(value: unknown, limit = 20_000) {
 }
 
 function jsonText(value: unknown, limit = 12_000) {
+  let remaining = limit
+  const seen = new WeakSet<object>()
+  const visit = (entry: unknown, depth: number): unknown => {
+    if (remaining <= 0) return "[truncated]"
+    remaining -= 4
+    if (entry == null || typeof entry === "boolean" || typeof entry === "number") return entry
+    if (typeof entry === "string") {
+      const text = entry.slice(0, Math.min(remaining, 1_000))
+      remaining -= text.length
+      return text.length < entry.length ? `${text}[truncated]` : text
+    }
+    if (typeof entry !== "object") return limitedText(entry, Math.min(remaining, 200))
+    if (seen.has(entry) || depth >= 4 || remaining <= 0) return "[truncated]"
+    seen.add(entry)
+    if (Array.isArray(entry)) return entry.slice(0, 25).map((item) => visit(item, depth + 1))
+    const result: Record<string, unknown> = {}
+    let count = 0
+    for (const key in entry) {
+      if (!Object.prototype.hasOwnProperty.call(entry, key)) continue
+      const cleanKey = key.slice(0, 200)
+      remaining -= cleanKey.length + 4
+      if (remaining <= 0) break
+      result[cleanKey] = visit((entry as Record<string, unknown>)[key], depth + 1)
+      count += 1
+      if (count >= 25) break
+    }
+    return result
+  }
   try {
-    return limitedText(JSON.stringify(value, null, 2), limit)
+    return limitedText(JSON.stringify(visit(value, 0), null, 2), limit)
   } catch {
     return "[unserializable]"
   }
@@ -220,7 +277,7 @@ function controllerPart(value: unknown) {
   const part = recordValue(value) ?? {}
   const base = { id: limitedText(part.id, 200), type: limitedText(part.type, 100) }
   if (part.type === "text" || part.type === "reasoning") {
-    return { ...base, text: limitedText(part.text, 30_000), time: part.time }
+    return { ...base, text: limitedText(part.text, 12_000), time: part.time }
   }
   if (part.type === "tool") {
     const state = recordValue(part.state) ?? {}
@@ -231,9 +288,9 @@ function controllerPart(value: unknown) {
       state: {
         status: limitedText(state.status, 40),
         title: limitedText(state.title, 500),
-        input: jsonText(state.input),
-        output: limitedText(state.output, 24_000),
-        error: limitedText(state.error, 12_000),
+        input: jsonText(state.input, 8_000),
+        output: limitedText(state.output, 12_000),
+        error: limitedText(state.error, 8_000),
         time: state.time,
       },
     }
@@ -256,6 +313,16 @@ function controllerMessage(value: unknown) {
   const model = recordValue(info.model)
   const error = recordValue(info.error)
   const errorData = recordValue(error?.data)
+  const parts: ReturnType<typeof controllerPart>[] = []
+  let partsBytes = 0
+  const sourceParts = Array.isArray(entry.parts) ? entry.parts.slice(-50).reverse() : []
+  for (const sourcePart of sourceParts) {
+    const part = controllerPart(sourcePart)
+    const partBytes = jsonBytes(part)
+    if (partsBytes + partBytes > MAX_CONTROLLER_MESSAGE_BYTES - 20_000) continue
+    parts.unshift(part)
+    partsBytes += partBytes
+  }
   return {
     id: limitedText(info.id, 200),
     role: info.role === "user" ? "user" : "assistant",
@@ -268,7 +335,7 @@ function controllerMessage(value: unknown) {
     tokens: info.tokens,
     finish: limitedText(info.finish, 200),
     error: limitedText(errorData?.message ?? error?.name, 2_000),
-    parts: Array.isArray(entry.parts) ? entry.parts.map(controllerPart) : [],
+    parts,
   }
 }
 
@@ -516,6 +583,10 @@ function canvasCsp(allowedAssetOrigins: string[]) {
   ].join("; ")
 }
 
+function frameCsp(allowedAssetOrigins: string[], allowForms: boolean) {
+  return `${canvasCsp(allowedAssetOrigins)}; sandbox allow-scripts${allowForms ? " allow-forms" : ""}; frame-ancestors 'self'`
+}
+
 const BRIDGE_HTML = `<script>
 (function () {
   var channel = new MessageChannel();
@@ -629,7 +700,7 @@ const BRIDGE_HTML = `<script>
   Object.defineProperty(window, "opencode", {
     configurable: false,
     writable: false,
-    value: Object.freeze({ submit: submit, setHeight: setHeight, fillViewport: fillViewport, controller: controller })
+    value: Object.freeze({ submit: submit, setHeight: setHeight, fillViewport: fillViewport__REINDR_CONTROLLER_PROPERTY__ })
   });
   function autoHeight() {
     if (manualHeight) return;
@@ -756,13 +827,14 @@ function documentParts(html: string) {
   }
 }
 
-function canvasDocument(html: string, sharedCSS: string, allowedAssetOrigins: string[]) {
+function canvasDocument(html: string, sharedCSS: string, allowedAssetOrigins: string[], controllerEnabled: boolean) {
   const parts = documentParts(html)
   const csp = canvasCsp(allowedAssetOrigins).replaceAll("&", "&amp;").replaceAll('"', "&quot;")
-  return `<!doctype html><html class="${escapeHTML(parts.htmlClass)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer">${BRIDGE_HTML}<style id="reindr-default-styles">${safeStyle(DEFAULT_SHARED_CSS)}</style><style id="reindr-shared-styles">${safeStyle(sharedCSS)}</style>${parts.head}</head><body class="${escapeHTML(parts.bodyClass)}">${parts.body}</body></html>`
+  const bridge = BRIDGE_HTML.replace("__REINDR_CONTROLLER_PROPERTY__", controllerEnabled ? ", controller: controller" : "")
+  return `<!doctype html><html class="${escapeHTML(parts.htmlClass)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer">${bridge}<style id="reindr-default-styles">${safeStyle(DEFAULT_SHARED_CSS)}</style><style id="reindr-shared-styles">${safeStyle(sharedCSS)}</style>${parts.head}</head><body class="${escapeHTML(parts.bodyClass)}">${parts.body}</body></html>`
 }
 
-function landingHtml(sessions: SessionSummary[], templates: TemplateSummary[], selectedView: "sessions" | "templates") {
+function landingHtml(sessions: SessionSummary[], templates: TemplateSummary[], selectedView: "sessions" | "templates", token: string | null) {
   const sessionLinks = sessions.map((session) => `
       <a class="session" href="${escapeHTML(session.url)}">
         <strong>${escapeHTML(session.title)}</strong>
@@ -816,8 +888,8 @@ function landingHtml(sessions: SessionSummary[], templates: TemplateSummary[], s
   <aside>
     <p class="wordmark">Reindr</p>
     <div class="tabs" role="tablist" aria-label="Reindr navigation">
-      <a class="tab${selectedView === "sessions" ? " active" : ""}" role="tab" aria-selected="${selectedView === "sessions"}" href="/?view=sessions">Sessions</a>
-      <a class="tab${selectedView === "templates" ? " active" : ""}" role="tab" aria-selected="${selectedView === "templates"}" href="/?view=templates">Templates</a>
+      <a class="tab${selectedView === "sessions" ? " active" : ""}" role="tab" aria-selected="${selectedView === "sessions"}" href="/?view=sessions${token ? `&amp;token=${escapeHTML(token)}` : ""}">Sessions</a>
+      <a class="tab${selectedView === "templates" ? " active" : ""}" role="tab" aria-selected="${selectedView === "templates"}" href="/?view=templates${token ? `&amp;token=${escapeHTML(token)}` : ""}">Templates</a>
     </div>
     <nav aria-label="${selectedView === "templates" ? "Saved Reindr templates" : "Running Reindr sessions"}">${items}
     </nav>
@@ -885,7 +957,6 @@ function templatePreviewHtml(name: string, frameURL: string, nonce: string, temp
       }
     };
     port.start();
-    port.postMessage({ kind: "reindr-connected" });
   });
   frame.src = ${JSON.stringify(frameURL)};
 </script>
@@ -961,7 +1032,7 @@ function shellHtml(nonce: string) {
   var currentSession = match ? decodeURIComponent(match[1]) : null;
   var canvases = {};
   var sessions = [];
-  var currentView = { container: null, iframe: null, frameURL: null, port: null, restoreState: null, pageScroll: null };
+  var currentView = { iframe: null, frameURL: null, port: null, restoreState: null, pageScroll: null };
   var stateRequests = {};
   var stateRequestID = 0;
   var ws;
@@ -1117,7 +1188,7 @@ function shellHtml(nonce: string) {
     iframe.setAttribute("sandbox", "allow-scripts allow-forms");
     iframe.setAttribute("referrerpolicy", "no-referrer");
     iframe.setAttribute("title", sessionTitle(canvas.sessionID));
-    currentView = { container: view, iframe: iframe, frameURL: canvas.frameURL, port: null, restoreState: state, pageScroll: pageScroll || null };
+    currentView = { iframe: iframe, frameURL: canvas.frameURL, port: null, restoreState: state, pageScroll: pageScroll || null };
     iframe.src = canvas.frameURL;
     view.appendChild(iframe);
     main.appendChild(view);
@@ -1143,7 +1214,7 @@ function shellHtml(nonce: string) {
     if (!canvas) {
       if (currentView.port) currentView.port.close();
       main.replaceChildren();
-      currentView = { container: null, iframe: null, frameURL: null, port: null, restoreState: null, pageScroll: null };
+      currentView = { iframe: null, frameURL: null, port: null, restoreState: null, pageScroll: null };
       var empty = document.createElement("div");
       empty.className = "empty";
       empty.textContent = "Waiting for this session's UI file.";
@@ -1247,12 +1318,16 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   const knownSessions = new Set<string>()
   const sessionAgents = new Map<string, string>()
   const sessionFrameTokens = new Map<string, string>()
+  const templateFrameCapabilities = new Map<string, { name: string; expiresAt: number }>()
   const sessionTitles = new Map<string, string>()
   const peerPanels = new Map<string, PanelRegistry>()
   const sockets = new Set<PanelSocket>()
   const submissionQueues = new Map<string, Submission[]>()
   const sessionStatus = new Map<string, "idle" | "busy" | "unknown">()
   const flushingSessions = new Set<string>()
+  const sessionStatusGenerations = new Map<string, number>()
+  const activeControllerRequests = new Set<string>()
+  const lastControllerSnapshots = new Map<string, number>()
   const refreshGenerations = new Map<string, number>()
   const retryTimers = new Set<ReturnType<typeof setTimeout>>()
 
@@ -1277,9 +1352,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
 
   const loadBuiltInTemplate = async (file: URL, fallback: string, name: string) => {
     try {
-      const info = await stat(file)
-      if (!info.isFile() || info.size > MAX_TEMPLATE_BYTES) throw new Error(`template exceeds ${MAX_TEMPLATE_BYTES} bytes`)
-      const template = await readFile(file, "utf8")
+      const template = await readBoundedFile(file, MAX_TEMPLATE_BYTES, "template")
       if (!template.trim()) throw new Error("template cannot be empty")
       return template
     } catch (error) {
@@ -1292,6 +1365,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     loadBuiltInTemplate(BUILT_IN_LOADING_TEMPLATE, FALLBACK_LOADING_TEMPLATE, "reindr-loading.html"),
     loadBuiltInTemplate(BUILT_IN_CONTROLLER_TEMPLATE, FALLBACK_CONTROLLER_TEMPLATE, "opencode-controller.html"),
   ])
+  const trustedControllerHash = createHash("sha256").update(defaultControllerTemplate).digest("hex")
 
   const canvasFile = (sessionID: string) => path.join(config.canvasDirectory, canvasFileName(sessionID))
 
@@ -1303,6 +1377,21 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     if (existing) return existing
     const token = randomToken()
     sessionFrameTokens.set(sessionID, token)
+    return token
+  }
+
+  const templateFrameToken = (name: string) => {
+    const now = Date.now()
+    for (const [token, capability] of templateFrameCapabilities) {
+      if (capability.expiresAt <= now) templateFrameCapabilities.delete(token)
+    }
+    while (templateFrameCapabilities.size >= MAX_TEMPLATE_FRAME_CAPABILITIES) {
+      const oldest = templateFrameCapabilities.keys().next().value
+      if (!oldest) break
+      templateFrameCapabilities.delete(oldest)
+    }
+    const token = randomToken()
+    templateFrameCapabilities.set(token, { name, expiresAt: now + TEMPLATE_FRAME_CAPABILITY_MS })
     return token
   }
 
@@ -1326,13 +1415,13 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     }
   }
 
-  const broadcastToSession = (sessionID: string, message: ServerMessage) => {
+  const broadcast = (message: ServerMessage) => {
     for (const socket of sockets) send(socket, message)
   }
 
   const broadcastCanvas = (sessionID: string) => {
     const canvas = canvases.get(sessionID)
-    broadcastToSession(sessionID, { type: "session-canvas", sessionID, canvas: canvas ? canvasForClient(canvas) : null })
+    broadcast({ type: "session-canvas", sessionID, canvas: canvas ? canvasForClient(canvas) : null })
   }
 
   const broadcastSubmissionStatus = (submission: Submission, status: "queued" | "sent" | "failed", message: string) => {
@@ -1408,9 +1497,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     let handle
     try {
       handle = await open(file, constants.O_RDWR | constants.O_NOFOLLOW | constants.O_NONBLOCK)
-      const info = await handle.stat()
-      if (!info.isFile() || info.size > MAX_CANVAS_HTML_BYTES) return false
-      const existing = await handle.readFile("utf8")
+      const existing = await readBoundedHandle(handle, MAX_CANVAS_HTML_BYTES, "UI file")
       const digest = createHash("sha256").update(existing).digest("hex")
       const replacementText = LEGACY_CONTROLLER_HASHES.has(digest)
         ? defaultControllerTemplate
@@ -1450,10 +1537,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
       let html: string
       try {
-        const info = await handle.stat()
-        if (!info.isFile()) throw new Error("UI path must be a regular file")
-        if (info.size > MAX_CANVAS_HTML_BYTES) throw new Error(`UI file exceeds ${MAX_CANVAS_HTML_BYTES} bytes`)
-        html = await handle.readFile("utf8")
+        html = await readBoundedHandle(handle, MAX_CANVAS_HTML_BYTES, "UI file")
       } finally {
         await handle.close()
       }
@@ -1474,7 +1558,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         sessionTitle,
         agent: sessionAgents.get(sessionID) ?? existing?.agent,
         html,
-        file,
+        trustedController: createHash("sha256").update(html).digest("hex") === trustedControllerHash,
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
         restored,
@@ -1542,10 +1626,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       if (await realpath(config.templateDirectory) !== realTemplateDirectory) throw new Error("Template directory changed after plugin startup")
       const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
       try {
-        const info = await handle.stat()
-        if (!info.isFile()) throw new Error("Template must be a regular file")
-        if (info.size > MAX_TEMPLATE_BYTES) throw new Error(`template exceeds ${MAX_TEMPLATE_BYTES} bytes`)
-        const template = await handle.readFile("utf8")
+        const template = await readBoundedHandle(handle, MAX_TEMPLATE_BYTES, "template")
         if (!template.trim()) throw new Error("Template cannot be empty")
         return template
       } finally {
@@ -1612,18 +1693,14 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   const loadSharedStyles = async () => {
     const styles: string[] = []
     try {
-      const info = await stat(BUILT_IN_TAILWIND_STYLESHEET)
-      if (info.size > MAX_STYLESHEET_BYTES) throw new Error(`built-in Tailwind stylesheet exceeds ${MAX_STYLESHEET_BYTES} bytes`)
-      styles.push(await readFile(BUILT_IN_TAILWIND_STYLESHEET, "utf8"))
+      styles.push(await readBoundedFile(BUILT_IN_TAILWIND_STYLESHEET, MAX_STYLESHEET_BYTES, "built-in Tailwind stylesheet"))
     } catch (error) {
       log("warn", "failed to load built-in Tailwind stylesheet", { error: String(error) })
     }
     if (config.stylesheetPath) {
       const file = resolveFile(worktree, config.stylesheetPath)
       try {
-        const info = await stat(file)
-        if (info.size > MAX_STYLESHEET_BYTES) throw new Error(`stylesheet exceeds ${MAX_STYLESHEET_BYTES} bytes`)
-        styles.push(await readFile(file, "utf8"))
+        styles.push(await readBoundedFile(file, MAX_STYLESHEET_BYTES, "stylesheet"))
         log("info", "loaded shared UI stylesheet", { file })
       } catch (error) {
         log("warn", "failed to load shared UI stylesheet", { file, error: String(error) })
@@ -1710,9 +1787,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         if (!entry.isFile() || !entry.name.endsWith(".json")) return
         const file = path.join(registryDirectory, entry.name)
         try {
-          const info = await stat(file)
-          if (info.size > 1_000_000) throw new Error("registry record is too large")
-          const parsed = JSON.parse(await readFile(file, "utf8")) as Partial<PanelRegistry>
+          const parsed = JSON.parse(await readBoundedFile(file, 1_000_000, "registry record")) as Partial<PanelRegistry>
           if (
             parsed.version !== 1 ||
             typeof parsed.instanceID !== "string" ||
@@ -1761,9 +1836,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       const file = path.join(registryDirectory, `${owner}.json`)
       const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
       try {
-        const info = await handle.stat()
-        if (!info.isFile() || info.size > 1_000_000) return false
-        const record = JSON.parse(await handle.readFile("utf8")) as Partial<PanelRegistry>
+        const record = JSON.parse(await readBoundedHandle(handle, 1_000_000, "registry record")) as Partial<PanelRegistry>
         return record.instanceID === owner && typeof record.updatedAt === "number" && Date.now() - record.updatedAt <= REGISTRY_STALE_MS
       } finally {
         await handle.close()
@@ -1794,9 +1867,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       try {
         const handle = await open(browserLockFile, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
         try {
-          const info = await handle.stat()
-          if (!info.isFile() || info.size > 10_000) throw new Error("invalid browser lock")
-          const parsed = JSON.parse(await handle.readFile("utf8")) as { instanceID?: unknown }
+          const parsed = JSON.parse(await readBoundedHandle(handle, 10_000, "browser lock")) as { instanceID?: unknown }
           if (typeof parsed.instanceID === "string") owner = parsed.instanceID
         } finally {
           await handle.close()
@@ -1814,7 +1885,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     ownsBrowserLock = false
     try {
       await assertRegistryDirectory()
-      const parsed = JSON.parse(await readFile(browserLockFile, "utf8")) as { instanceID?: unknown }
+      const parsed = JSON.parse(await readBoundedFile(browserLockFile, 10_000, "browser lock")) as { instanceID?: unknown }
       if (parsed.instanceID === instanceID) await rm(browserLockFile, { force: true })
     } catch {}
   }
@@ -1847,14 +1918,21 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     return sections.join("\n\n")
   }
 
+  const updateSessionStatus = (sessionID: string, status: "idle" | "busy" | "unknown") => {
+    sessionStatusGenerations.set(sessionID, (sessionStatusGenerations.get(sessionID) ?? 0) + 1)
+    sessionStatus.set(sessionID, status)
+  }
+
   const refreshSessionStatus = async (sessionID: string) => {
+    const generation = sessionStatusGenerations.get(sessionID) ?? 0
     try {
       const response = await client.session.status()
       const statuses = sdkData<Record<string, { type?: string }>>(response)
       const status = statuses?.[sessionID]?.type
       const normalized = status === "idle" ? "idle" : status ? "busy" : "unknown"
-      sessionStatus.set(sessionID, normalized)
-      return normalized
+      if ((sessionStatusGenerations.get(sessionID) ?? 0) !== generation) return sessionStatus.get(sessionID) ?? "unknown"
+      updateSessionStatus(sessionID, normalized)
+      return sessionStatus.get(sessionID) ?? normalized
     } catch (error) {
       log("warn", "could not read session status", { sessionID, error: String(error) })
       return sessionStatus.get(sessionID) ?? "unknown"
@@ -1872,22 +1950,25 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       safe<any[]>(client.command.list(), []),
     ])
     const connected = new Set(Array.isArray(providerData?.connected) ? providerData.connected : [])
-    const providers = (Array.isArray(providerData?.all) ? providerData.all : []).map((provider: any) => ({
+    const providers = (Array.isArray(providerData?.all) ? providerData.all : []).slice(0, 20).map((provider: any) => ({
       id: limitedText(provider?.id, 200),
       name: limitedText(provider?.name, 300),
       connected: connected.has(provider?.id),
       defaultModel: limitedText(providerData?.default?.[provider?.id], 300),
-      models: Object.values(recordValue(provider?.models) ?? {}).map((model: any) => ({
+      models: Object.values(recordValue(provider?.models) ?? {}).slice(0, 50).map((model: any) => ({
         id: limitedText(model?.id, 300),
         name: limitedText(model?.name, 300),
         reasoning: Boolean(model?.reasoning),
         attachment: Boolean(model?.attachment),
         toolCall: Boolean(model?.tool_call),
         status: limitedText(model?.status ?? "active", 40),
-        limit: model?.limit,
+        limit: {
+          context: Number(model?.limit?.context) || 0,
+          output: Number(model?.limit?.output) || 0,
+        },
       })).filter((model: any) => model.id),
     })).filter((provider: any) => provider.id)
-    const agents = agentData.map((agent: any) => ({
+    const agents = agentData.slice(0, 100).map((agent: any) => ({
       name: limitedText(agent?.name, 200),
       description: limitedText(agent?.description, 1_000),
       mode: limitedText(agent?.mode, 40),
@@ -1897,7 +1978,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         modelID: limitedText(agent.model.modelID, 300),
       } : null,
     })).filter((agent: any) => agent.name)
-    const commands = commandData.map((command: any) => ({
+    const commands = commandData.slice(0, 200).map((command: any) => ({
       name: limitedText(command?.name, 200),
       description: limitedText(command?.description, 1_000),
       agent: limitedText(command?.agent, 200),
@@ -1919,9 +2000,17 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       safe<Record<string, any>>(client.session.status(), {}),
       controllerCatalog(),
     ])
-    const normalizedMessages = messages.map(controllerMessage)
+    const normalizedMessages: ReturnType<typeof controllerMessage>[] = []
+    let historyBytes = 0
+    for (const message of messages.slice(-100).reverse()) {
+      const normalized = controllerMessage(message)
+      const messageBytes = jsonBytes(normalized)
+      if (historyBytes + messageBytes > MAX_CONTROLLER_HISTORY_BYTES) continue
+      normalizedMessages.unshift(normalized)
+      historyBytes += messageBytes
+    }
     const lastUser = [...normalizedMessages].reverse().find((message) => message.role === "user")
-    return {
+    const snapshot = {
       generatedAt: Date.now(),
       session: {
         id: limitedText(session?.id ?? sessionID, 200),
@@ -1938,7 +2027,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       agents: catalog.agents,
       providers: catalog.providers,
       commands: catalog.commands,
-      children: children.map((child: any) => ({
+      children: children.slice(0, 200).map((child: any) => ({
         id: limitedText(child?.id, 200),
         title: limitedText(child?.title ?? child?.id, 500),
         parentID: limitedText(child?.parentID, 200),
@@ -1947,6 +2036,12 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       })),
       messages: normalizedMessages,
     }
+    while (snapshot.messages.length > 1 && jsonBytes(snapshot) > MAX_CONTROLLER_RESPONSE_BYTES) snapshot.messages.shift()
+    while (snapshot.messages.length && snapshot.messages[0].parts.length && jsonBytes(snapshot) > MAX_CONTROLLER_RESPONSE_BYTES) {
+      snapshot.messages[0].parts.shift()
+    }
+    if (jsonBytes(snapshot) > MAX_CONTROLLER_RESPONSE_BYTES) throw new Error("Controller snapshot exceeds the response limit.")
+    return snapshot
   }
 
   const controllerPayload = (value: unknown) => recordValue(value) ?? {}
@@ -1957,45 +2052,89 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     return providerID && modelID ? { providerID, modelID } : undefined
   }
 
+  const controllerSelection = async (payload: Record<string, any>) => {
+    const catalog = await controllerCatalog()
+    const agent = limitedText(payload.agent, 200).trim() || undefined
+    if (agent && !catalog.agents.some((item) => item.name === agent)) throw new Error("Unknown OpenCode agent.")
+    const model = controllerModel(payload)
+    if (model) {
+      const provider = catalog.providers.find((item) => item.id === model.providerID)
+      if (!provider?.connected || !provider.models.some((item: any) => item.id === model.modelID)) throw new Error("Unknown or disconnected OpenCode model.")
+    }
+    return { agent, model, catalog }
+  }
+
+  const enqueueSubmission = (submission: Submission) => {
+    const queuedCount = [...submissionQueues.values()].reduce((total, queue) => total + queue.length, 0)
+    if (queuedCount >= MAX_PENDING_SUBMISSIONS) throw new Error("Too many interactions are waiting for an agent session.")
+    const queue = submissionQueues.get(submission.sessionID) ?? []
+    queue.push(submission)
+    submissionQueues.set(submission.sessionID, queue)
+    void flushSession(submission.sessionID)
+  }
+
+  const wakeSessionQueue = (sessionID: string) => {
+    if (!submissionQueues.get(sessionID)?.length) return
+    if (sessionStatus.get(sessionID) === "idle") {
+      queueMicrotask(() => { void flushSession(sessionID) })
+      return
+    }
+    if (sessionStatus.get(sessionID) !== "unknown") return
+    const timer = setTimeout(() => {
+      retryTimers.delete(timer)
+      void flushSession(sessionID)
+    }, 500)
+    retryTimers.add(timer)
+  }
+
   const handleController = async (sessionID: string, action: "snapshot" | "prompt" | "command" | "abort", payloadValue: unknown) => {
+    if (!canvases.get(sessionID)?.trustedController) throw new Error("Controller access is limited to the unmodified built-in controller.")
     const payload = controllerPayload(payloadValue)
     if (action === "snapshot") return controllerSnapshot(sessionID)
     if (action === "prompt") {
       const prompt = limitedText(payload.prompt, MAX_DATA_BYTES).trim()
       if (!prompt || Buffer.byteLength(prompt, "utf8") > MAX_DATA_BYTES) throw new Error("Prompt must be between 1 byte and 64 KB.")
-      const queuedCount = [...submissionQueues.values()].reduce((total, queue) => total + queue.length, 0)
-      if (queuedCount >= MAX_PENDING_SUBMISSIONS) throw new Error("Too many interactions are waiting for an agent session.")
-      const agent = limitedText(payload.agent, 200).trim() || undefined
-      const submission: Submission = { id: randomToken(18), sessionID, agent, model: controllerModel(payload), prompt }
-      const queue = submissionQueues.get(sessionID) ?? []
-      queue.push(submission)
-      submissionQueues.set(sessionID, queue)
+      const { agent, model } = await controllerSelection(payload)
+      const submission: Submission = { id: randomToken(18), sessionID, agent, model, prompt }
       if (agent) sessionAgents.set(sessionID, agent)
-      void flushSession(sessionID)
+      enqueueSubmission(submission)
       return { accepted: true, id: submission.id }
     }
     if (action === "command") {
       const command = limitedText(payload.command, 200).trim()
       const argumentsText = limitedText(payload.arguments, MAX_DATA_BYTES)
-      const catalog = await controllerCatalog()
+      if (Buffer.byteLength(argumentsText, "utf8") > MAX_DATA_BYTES) throw new Error("Command arguments exceed 64 KB.")
+      const { agent, model, catalog } = await controllerSelection(payload)
       if (!command || !catalog.commands.some((item) => item.name === command)) throw new Error("Unknown OpenCode command.")
-      const agent = limitedText(payload.agent, 200).trim() || undefined
-      const model = controllerModel(payload)
+      if (flushingSessions.has(sessionID) || submissionQueues.get(sessionID)?.length) throw new Error("Wait for queued session interactions before running a command.")
       if (agent) sessionAgents.set(sessionID, agent)
-      void client.session.command({
-        path: { id: sessionID },
-        body: {
-          command,
-          arguments: argumentsText,
-          ...(agent ? { agent } : {}),
-          ...(model ? { model: `${model.providerID}/${model.modelID}` } : {}),
-        },
-      }).catch((error) => log("error", "controller command failed", { sessionID, command, error: String(error) }))
+      flushingSessions.add(sessionID)
+      let dispatched = false
+      try {
+        if (await refreshSessionStatus(sessionID) !== "idle") throw new Error("The session must be idle before running a command.")
+        dispatched = true
+        updateSessionStatus(sessionID, "busy")
+        sdkData(await client.session.command({
+          path: { id: sessionID },
+          body: {
+            command,
+            arguments: argumentsText,
+            ...(agent ? { agent } : {}),
+            ...(model ? { model: `${model.providerID}/${model.modelID}` } : {}),
+          },
+        }))
+      } catch (error) {
+        if (dispatched) updateSessionStatus(sessionID, "unknown")
+        throw error
+      } finally {
+        flushingSessions.delete(sessionID)
+        wakeSessionQueue(sessionID)
+      }
       return { accepted: true }
     }
     if (action === "abort") {
       const aborted = sdkData<boolean>(await client.session.abort({ path: { id: sessionID } }))
-      sessionStatus.set(sessionID, "unknown")
+      updateSessionStatus(sessionID, "unknown")
       return { aborted }
     }
     throw new Error("Unsupported controller action.")
@@ -2005,15 +2144,16 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     if (disposed || flushingSessions.has(sessionID)) return
     const queue = submissionQueues.get(sessionID)
     if (!queue?.length) return
-    const cachedStatus = sessionStatus.get(sessionID)
-    const status = !cachedStatus || cachedStatus === "unknown" ? await refreshSessionStatus(sessionID) : cachedStatus
-    if (status !== "idle") return
-    const submission = queue.shift()
-    if (!submission) return
-    if (!queue.length) submissionQueues.delete(sessionID)
     flushingSessions.add(sessionID)
-    sessionStatus.set(sessionID, "busy")
+    let submission: Submission | undefined
     try {
+      const cachedStatus = sessionStatus.get(sessionID)
+      const status = !cachedStatus || cachedStatus === "unknown" ? await refreshSessionStatus(sessionID) : cachedStatus
+      if (status !== "idle") return
+      submission = queue.shift()
+      if (!submission) return
+      if (!queue.length) submissionQueues.delete(sessionID)
+      updateSessionStatus(sessionID, "busy")
       const response = await client.session.promptAsync({
         path: { id: submission.sessionID },
         body: {
@@ -2025,18 +2165,12 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       sdkData(response)
       broadcastSubmissionStatus(submission, "sent", "UI interaction was sent to the agent.")
     } catch (error) {
-      sessionStatus.set(sessionID, "unknown")
-      broadcastSubmissionStatus(submission, "failed", `UI interaction failed: ${String(error)}`)
+      updateSessionStatus(sessionID, "unknown")
+      if (submission) broadcastSubmissionStatus(submission, "failed", `UI interaction failed: ${String(error)}`)
       log("error", "failed to submit a UI interaction", { sessionID, error: String(error) })
     } finally {
       flushingSessions.delete(sessionID)
-      if (submissionQueues.get(sessionID)?.length && sessionStatus.get(sessionID) === "unknown") {
-        const timer = setTimeout(() => {
-          retryTimers.delete(timer)
-          void flushSession(sessionID)
-        }, 500)
-        retryTimers.add(timer)
-      }
+      wakeSessionQueue(sessionID)
     }
   }
 
@@ -2046,16 +2180,19 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     canvases.delete(sessionID)
     submissionQueues.delete(sessionID)
     sessionStatus.delete(sessionID)
+    sessionStatusGenerations.delete(sessionID)
     sessionAgents.delete(sessionID)
     sessionTitles.delete(sessionID)
     sessionFrameTokens.delete(sessionID)
+    activeControllerRequests.delete(sessionID)
+    lastControllerSnapshots.delete(sessionID)
     try {
       if (await realpath(config.canvasDirectory) !== realCanvasDirectory) throw new Error("UI directory changed after plugin startup")
       await rm(canvasFile(sessionID), { force: true })
     } catch (error) {
       log("warn", "failed to remove session UI file", { sessionID, file: canvasFile(sessionID), error: String(error) })
     }
-    broadcastToSession(sessionID, { type: "session-remove", sessionID })
+    broadcast({ type: "session-remove", sessionID })
     broadcastSessions()
     await writeRegistry()
   }
@@ -2071,11 +2208,27 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     }
     if (!socket.data.sessionID) return
     if (message?.type === "controller") {
-      if (!message.id || message.id.length > 100) return
+      if (!message.id || message.id.length > 100 || !["snapshot", "prompt", "command", "abort"].includes(message.action)) return
+      const sessionID = socket.data.sessionID
+      if (activeControllerRequests.has(sessionID)) {
+        send(socket, { type: "controller-result", id: message.id, ok: false, error: "Another controller request is still running." })
+        return
+      }
+      const now = Date.now()
+      if (message.action === "snapshot" && now - (lastControllerSnapshots.get(sessionID) ?? 0) < 250) {
+        send(socket, { type: "controller-result", id: message.id, ok: false, error: "Controller snapshots are limited to four requests per second." })
+        return
+      }
+      activeControllerRequests.add(sessionID)
+      if (message.action === "snapshot") lastControllerSnapshots.set(sessionID, now)
       try {
-        send(socket, { type: "controller-result", id: message.id, ok: true, value: await handleController(socket.data.sessionID, message.action, message.payload) })
+        const value = await handleController(sessionID, message.action, message.payload)
+        if (jsonBytes(value) > MAX_CONTROLLER_RESPONSE_BYTES) throw new Error("Controller response exceeds the response limit.")
+        send(socket, { type: "controller-result", id: message.id, ok: true, value })
       } catch (error) {
         send(socket, { type: "controller-result", id: message.id, ok: false, error: String(error) })
+      } finally {
+        activeControllerRequests.delete(sessionID)
       }
       return
     }
@@ -2091,22 +2244,18 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         return
       }
     }
-    const queuedCount = [...submissionQueues.values()].reduce((total, queue) => total + queue.length, 0)
-    if (queuedCount >= MAX_PENDING_SUBMISSIONS) {
-      send(socket, { type: "notice", level: "error", message: "Too many interactions are waiting for an agent session." })
-      return
-    }
     const submission: Submission = {
       id: randomToken(18),
       sessionID: canvas.sessionID,
       agent: canvas.agent,
       prompt: promptText(message.prompt, message.data, hasData),
     }
-    const queue = submissionQueues.get(submission.sessionID) ?? []
-    queue.push(submission)
-    submissionQueues.set(submission.sessionID, queue)
-    broadcastSubmissionStatus(submission, "queued", "UI interaction is waiting for the session.")
-    void flushSession(submission.sessionID)
+    try {
+      enqueueSubmission(submission)
+      broadcastSubmissionStatus(submission, "queued", "UI interaction is waiting for the session.")
+    } catch (error) {
+      send(socket, { type: "notice", level: "error", message: String(error) })
+    }
   }
 
   const startServer = () => {
@@ -2121,13 +2270,15 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       hostname: "127.0.0.1",
       async fetch(req: Request, server: { upgrade(request: Request, options: { data: SocketData }): boolean }) {
         const url = new URL(req.url)
-        const landing = async () => new Response(landingHtml(
-          sessionsForClient(),
-          (await listTemplates()).map((name) => ({
+        if (panelOrigin && url.origin !== panelOrigin) return new Response("forbidden", { status: 403 })
+        const landing = async (authorized = false) => new Response(landingHtml(
+          authorized ? sessionsForClient() : [],
+          authorized ? (await listTemplates()).map((name) => ({
             name,
             url: `/template/${encodeURIComponent(name)}?token=${encodeURIComponent(authToken)}`,
-          })),
+          })) : [],
           url.searchParams.get("view") === "templates" ? "templates" : "sessions",
+          authorized ? authToken : null,
         ), {
           headers: {
             "content-type": "text/html; charset=utf-8",
@@ -2140,7 +2291,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         })
         if (url.pathname === "/ws") {
           const requestedSession = url.searchParams.get("session")
-          if (req.headers.get("origin") !== panelOrigin || url.searchParams.get("token") !== authToken) {
+          if (req.headers.get("origin") !== panelOrigin || url.searchParams.get("token") !== authToken || requestedSession && !canvases.has(requestedSession)) {
             return new Response("forbidden", { status: 403 })
           }
           return server.upgrade(req, { data: { sessionID: requestedSession } })
@@ -2157,30 +2308,34 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
           }
           const canvas = canvases.get(sessionID)
           if (!canvas) return new Response("not found", { status: 404 })
-          return new Response(canvasDocument(canvas.html, sharedStyles, config.allowedAssetOrigins), {
+          return new Response(canvasDocument(canvas.html, sharedStyles, config.allowedAssetOrigins, canvas.trustedController), {
             headers: {
               "content-type": "text/html; charset=utf-8",
               "cache-control": "no-store",
               "referrer-policy": "no-referrer",
               "x-content-type-options": "nosniff",
-              "content-security-policy": canvasCsp(config.allowedAssetOrigins),
+              "x-frame-options": "SAMEORIGIN",
+              "content-security-policy": frameCsp(config.allowedAssetOrigins, true),
             },
           })
         }
         const templateFrameMatch = url.pathname.match(/^\/template-frame\/([^/]+)$/)
         if (req.method === "GET" && templateFrameMatch) {
-          if (url.searchParams.get("token") !== authToken) return new Response("forbidden", { status: 403 })
           let name: string
           try { name = decodeURIComponent(templateFrameMatch[1]) } catch { return new Response("bad template", { status: 400 }) }
+          const capability = templateFrameCapabilities.get(url.searchParams.get("token") ?? "")
+          if (!capability || capability.name !== name || capability.expiresAt <= Date.now()) return new Response("forbidden", { status: 403 })
           let html: string
           try { html = await readSavedTemplate(name) } catch { return new Response("not found", { status: 404 }) }
-          return new Response(canvasDocument(html, sharedStyles, config.allowedAssetOrigins), {
+          const trustedController = createHash("sha256").update(html).digest("hex") === trustedControllerHash
+          return new Response(canvasDocument(html, sharedStyles, config.allowedAssetOrigins, trustedController), {
             headers: {
               "content-type": "text/html; charset=utf-8",
               "cache-control": "no-store",
               "referrer-policy": "no-referrer",
               "x-content-type-options": "nosniff",
-              "content-security-policy": canvasCsp(config.allowedAssetOrigins),
+              "x-frame-options": "SAMEORIGIN",
+              "content-security-policy": frameCsp(config.allowedAssetOrigins, false),
             },
           })
         }
@@ -2191,13 +2346,14 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         const templateMatch = url.pathname.match(/^\/template\/([^/]+)$/)
         if (url.pathname !== "/" && !sessionMatch && !templateMatch) return landing()
         if (url.searchParams.get("token") !== authToken) return landing()
+        if (url.pathname === "/" && url.searchParams.has("view")) return landing(true)
         if (templateMatch) {
           let name: string
-          try { name = decodeURIComponent(templateMatch[1]) } catch { return landing() }
-          try { await readSavedTemplate(name) } catch { return landing() }
+          try { name = decodeURIComponent(templateMatch[1]) } catch { return landing(true) }
+          try { await readSavedTemplate(name) } catch { return landing(true) }
           const nonce = randomToken(18)
-          const frameURL = `/template-frame/${encodeURIComponent(name)}?token=${encodeURIComponent(authToken)}`
-          const html = templatePreviewHtml(name, frameURL, nonce, "/?view=templates")
+          const frameURL = `/template-frame/${encodeURIComponent(name)}?token=${encodeURIComponent(templateFrameToken(name))}`
+          const html = templatePreviewHtml(name, frameURL, nonce, `/?view=templates&token=${encodeURIComponent(authToken)}`)
           return new Response(html, {
             headers: {
               "content-type": "text/html; charset=utf-8",
@@ -2211,8 +2367,8 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         }
         if (sessionMatch) {
           let sessionID: string
-          try { sessionID = decodeURIComponent(sessionMatch[1]) } catch { return landing() }
-          if (!canvases.has(sessionID)) return landing()
+          try { sessionID = decodeURIComponent(sessionMatch[1]) } catch { return landing(true) }
+          if (!canvases.has(sessionID)) return landing(true)
         }
         const html = shellHtml(shellNonce)
         const connectSource = panelOrigin ? `${panelOrigin.replace("http:", "ws:")} ${panelOrigin}` : "'self'"
@@ -2363,7 +2519,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         const sessionID = typeof properties.sessionID === "string" ? properties.sessionID : null
         const status = properties.status as { type?: string } | undefined
         if (sessionID && status?.type) {
-          sessionStatus.set(sessionID, status.type === "idle" ? "idle" : "busy")
+          updateSessionStatus(sessionID, status.type === "idle" ? "idle" : "busy")
           if (status.type === "idle") void flushSession(sessionID)
         }
       }
