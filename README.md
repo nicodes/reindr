@@ -170,17 +170,17 @@ Capability URLs expire when the OpenCode process exits. Use `widget_list` or a n
 
 ## Develop
 
-Install test dependencies:
+Install test dependencies with Bun:
 
 ```sh
-npm install
+bun install
 ```
 
 Run static checks and tests:
 
 ```sh
-npm run typecheck
-npm test
+bun run typecheck
+bun run test
 ```
 
 The core suite runs the real plugin through an HTTP/WebSocket Bun adapter. The browser suite launches `/usr/bin/chromium` and verifies shared-document composition, configurable styles, agent layout CSS, state preservation, the session drawer, CSP enforcement, direct interaction delivery, persistence, and click-to-activate restoration.
