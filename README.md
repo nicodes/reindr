@@ -58,6 +58,8 @@ The default file location is:
 
 Each OpenCode session gets a different file. The agent creates or edits that one file with the standard filesystem tools; there are no custom UI authoring tools or component schemas. A write triggers a live panel update, and the first non-empty UI opens its session panel automatically by default.
 
+The drawer lists every live UI for the project. When sessions belong to different OpenCode processes, their panel servers may use different ports; a small registry under `.opencode/ui/.panels/` links them so selecting a session navigates the current browser tab to its owning process. Once one project panel is active, additional processes do not automatically open duplicate tabs.
+
 The file may be a complete document or an HTML fragment. Keep CSS and JavaScript inline unless static asset hosts have been explicitly allowed.
 
 ## Browser Bridge
@@ -104,6 +106,8 @@ The HTML files are normal project-local files. `.opencode/ui/` is ignored by thi
 The plugin watches the directory for external changes and also checks the current session's file after ordinary tool calls. Whole-file updates preserve basic input values, checkbox state, selections, focus, and page scroll when corresponding controls still exist.
 
 Existing files are rediscovered when their session becomes active after an OpenCode restart. Restored JavaScript does not execute until the user clicks **Activate saved content**. Deleting an OpenCode session deletes its associated HTML file.
+
+Panel registry records heartbeat while their OpenCode process is running. Records that stop updating expire automatically, removing crashed or closed processes from navigation.
 
 Each UI file is limited to 1 MB of UTF-8 HTML. The optional shared stylesheet is limited to 200 KB.
 
@@ -156,7 +160,7 @@ Environment variables override plugin options.
 ## Security Model
 
 - The panel binds only to `127.0.0.1`.
-- Each agent-visible panel URL has a random capability token bound to exactly one session.
+- Each panel process has a random capability token covering its project-local sessions. Cross-process navigation uses loopback URLs advertised through the project registry.
 - WebSocket upgrades also require the exact panel `Origin`.
 - Session document routes use separate read-only tokens, so generated code never receives the WebSocket capability.
 - The trusted shell uses a nonce-based CSP and cannot be framed.
@@ -176,7 +180,7 @@ The CSP blocks `fetch`, WebSocket, form submission, and similar connection APIs.
 ## Routes
 
 - `/?token=...` redirects to the most recently updated session UI, or waits for initial content.
-- `/s/<session-id>?token=...` displays the UI authorized by that session-scoped token.
+- `/s/<session-id>?token=...` displays one project session and lets the drawer navigate to other registered sessions.
 - `/frame/<session-key>?token=...` serves the sandboxed session HTML with a limited read token.
 - `/ws?token=...` carries live updates and interactions.
 
@@ -197,12 +201,12 @@ bun run typecheck
 bun run test
 ```
 
-The core suite runs the real plugin through an HTTP/WebSocket Bun adapter. The browser suite launches `/usr/bin/chromium` and verifies file-backed live reload, session isolation, configurable styles, state preservation, session navigation, CSP enforcement, private bridge delivery, and click-to-activate restoration.
+The core suite runs the real plugin through an HTTP/WebSocket Bun adapter and verifies discovery across separate plugin ports. The browser suite launches `/usr/bin/chromium` and verifies file-backed live reload, cross-port session navigation, configurable styles, state preservation, CSP enforcement, private bridge delivery, and click-to-activate restoration.
 
 ## Prototype Limitations
 
 - Chromium is the only browser tested in this version.
-- The panel server and interaction queues belong to one OpenCode process. Parallel processes use separate fallback ports.
+- Panel servers and interaction queues remain process-local. The project registry connects their navigation without proxying interactions between processes.
 - Full-file updates preserve basic form/focus/scroll state, not JavaScript heap state or event state.
 - Full-document normalization preserves head and body contents but not attributes on the original `html` or `body` elements.
 - CDN assets require explicit trusted-host configuration.

@@ -1,7 +1,7 @@
 import { constants, watch, type FSWatcher } from "node:fs"
 import { createHash, randomBytes } from "node:crypto"
 import { spawn } from "node:child_process"
-import { mkdir, open, readFile, realpath, rm, stat } from "node:fs/promises"
+import { chmod, mkdir, open, readFile, readdir, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
 import type { Plugin, PluginOptions } from "@opencode-ai/plugin"
@@ -18,8 +18,19 @@ type Canvas = {
 }
 
 type SessionSummary = {
+  key: string
   id: string
   title: string
+  url: string
+  updatedAt: number
+}
+
+type PanelRegistry = {
+  version: 1
+  instanceID: string
+  pid: number
+  updatedAt: number
+  sessions: SessionSummary[]
 }
 
 type Submission = {
@@ -50,8 +61,8 @@ type ClientCanvas = Omit<Canvas, "html" | "file"> & {
 
 type ServerMessage =
   | { type: "init"; canvases: ClientCanvas[]; sessions: SessionSummary[] }
+  | { type: "sessions"; sessions: SessionSummary[] }
   | { type: "session-canvas"; sessionID: string; canvas: ClientCanvas | null }
-  | { type: "session"; session: SessionSummary }
   | { type: "session-remove"; sessionID: string }
   | { type: "submission-status"; id: string; status: "queued" | "sent" | "failed"; message: string }
   | { type: "notice"; level: "info" | "error"; message: string }
@@ -76,6 +87,8 @@ const MAX_CANVAS_HTML_BYTES = 1_000_000
 const MAX_STYLESHEET_BYTES = 200_000
 const MAX_DATA_BYTES = 64_000
 const MAX_PENDING_SUBMISSIONS = 100
+const REGISTRY_HEARTBEAT_MS = 5_000
+const REGISTRY_STALE_MS = 20_000
 
 function booleanOption(value: unknown, fallback: boolean) {
   if (typeof value === "boolean") return value
@@ -373,47 +386,42 @@ function shellHtml(nonce: string) {
 <meta name="referrer" content="no-referrer">
 <title>opencode generative UI</title>
 <style>
-  :root { --bg: #13110e; --panel: #1d1914; --raised: #252019; --edge: #393126; --ink: #f0e9dc; --muted: #a69b8d; --accent: #f4b942; --ok: #7cc47f; --bad: #e17161; color-scheme: dark; }
+  :root { --bg: #050505; --panel: #090909; --raised: #111; --hover: #171717; --edge: #242424; --ink: #f4f4f5; --muted: #7c7c82; --accent: #fafafa; --bad: #ff6259; color-scheme: dark; }
   * { box-sizing: border-box; }
   html, body { min-height: 100%; }
-  body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--ink); font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+  body { margin: 0; overflow-x: hidden; background: var(--bg); color: var(--ink); font: 13px/1.5 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
   body.drawer-open { overflow: hidden; }
   button, a { font: inherit; }
-  header { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 12px; height: 48px; padding: 8px 14px 8px 16px; background: color-mix(in srgb, var(--bg) 94%, transparent); border-bottom: 1px solid var(--edge); backdrop-filter: blur(12px); }
-  header h1 { margin: 0; font-size: 13px; letter-spacing: .05em; }
-  #status { display: flex; align-items: center; gap: 6px; margin-left: auto; color: var(--muted); font-size: 11px; }
-  #dot { width: 8px; height: 8px; border-radius: 50%; background: var(--bad); }
-  #dot.on { background: var(--ok); }
+  header { position: sticky; top: 0; z-index: 10; display: flex; align-items: center; gap: 10px; height: 48px; padding: 7px 14px; background: #050505e8; border-bottom: 1px solid #181818; box-shadow: 0 1px 0 #000; backdrop-filter: blur(18px) saturate(120%); }
+  header h1 { margin: 0; color: #d9d9dc; font-size: 12px; font-weight: 520; letter-spacing: .025em; }
   main { width: 100%; min-height: calc(100dvh - 48px); margin: 0; padding: 0; }
   .empty { display: grid; min-height: calc(100dvh - 48px); place-items: center; padding: 24px; color: var(--muted); text-align: center; }
   .agent-view { width: 100%; overflow: hidden; background: transparent; }
   iframe { display: block; width: 100%; height: 240px; min-height: calc(100dvh - 48px); border: 0; background: transparent; }
-  .dormant { display: grid; place-items: center; min-height: calc(100dvh - 48px); padding: 24px; text-align: center; background: var(--panel); }
+  .dormant { display: grid; place-items: center; min-height: calc(100dvh - 48px); padding: 24px; text-align: center; background: var(--bg); }
   .dormant p { max-width: 520px; margin: 0 0 14px; color: var(--muted); }
-  button { padding: 8px 13px; color: var(--ink); background: var(--raised); border: 1px solid var(--edge); border-radius: 6px; cursor: pointer; }
-  button:hover, button:focus-visible { border-color: var(--accent); outline: none; }
-  #session-toggle { display: grid; width: 32px; height: 32px; flex: 0 0 32px; place-items: center; padding: 0; color: var(--muted); background: transparent; }
-  #session-toggle svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.7; }
-  #session-toggle:hover, #session-toggle:focus-visible, #session-toggle[aria-expanded="true"] { color: var(--ink); }
-  #drawer-backdrop { position: fixed; inset: 48px 0 0; z-index: 19; background: #08070699; opacity: 0; pointer-events: none; transition: opacity .18s ease; }
+  button { padding: 8px 13px; color: var(--ink); background: var(--raised); border: 1px solid var(--edge); border-radius: 8px; cursor: pointer; }
+  button:hover { background: var(--hover); border-color: #343434; }
+  button:focus-visible { border-color: #555; outline: 2px solid #ffffff24; outline-offset: 2px; }
+  #session-toggle { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; padding: 0; color: #85858b; background: transparent; border-color: transparent; }
+  #session-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.55; }
+  #session-toggle:hover, #session-toggle:focus-visible, #session-toggle[aria-expanded="true"] { color: var(--ink); background: var(--raised); border-color: var(--edge); }
+  #drawer-backdrop { position: fixed; inset: 48px 0 0; z-index: 19; background: #000b; opacity: 0; pointer-events: none; transition: opacity .18s ease; backdrop-filter: blur(2px); }
   #drawer-backdrop.open { opacity: 1; pointer-events: auto; }
-  #session-drawer { position: fixed; inset: 48px auto 0 0; z-index: 20; display: grid; grid-template-rows: auto 1fr; width: min(380px, 90vw); height: calc(100dvh - 48px); color: var(--ink); background: var(--panel); border-right: 1px solid var(--edge); box-shadow: 20px 0 60px #0008; transform: translateX(-100%); visibility: hidden; transition: transform .2s ease, visibility 0s linear .2s; }
+  #session-drawer { position: fixed; inset: 48px auto 0 0; z-index: 20; width: min(340px, 88vw); height: calc(100dvh - 48px); color: var(--ink); background: #090909f7; border-right: 1px solid #1f1f1f; box-shadow: 24px 0 70px #000c; transform: translateX(-100%); visibility: hidden; transition: transform .2s cubic-bezier(.22, 1, .36, 1), visibility 0s linear .2s; backdrop-filter: blur(20px); }
   #session-drawer.open { transform: translateX(0); visibility: visible; transition-delay: 0s; }
-  .drawer-head { display: flex; align-items: center; min-height: 56px; padding: 10px 12px 10px 18px; border-bottom: 1px solid var(--edge); }
-  .drawer-head strong { font-size: 13px; letter-spacing: .04em; }
-  #drawer-close { margin-left: auto; padding: 6px 10px; color: var(--muted); background: transparent; }
-  #session-list { overflow: auto; padding: 10px; }
-  .drawer-empty { padding: 24px 10px; color: var(--muted); text-align: center; }
-  .drawer-session { display: block; padding: 12px 13px; color: var(--ink); border: 1px solid transparent; border-radius: 7px; text-decoration: none; }
-  .drawer-session + .drawer-session { margin-top: 4px; }
-  .drawer-session:hover, .drawer-session:focus-visible { background: var(--raised); border-color: var(--edge); outline: none; }
-  .drawer-session.active { background: var(--raised); border-color: var(--accent); }
-  .drawer-session strong { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .drawer-session span { display: block; margin-top: 3px; color: var(--muted); font-size: 11px; }
-  #toast { position: fixed; right: 16px; bottom: 16px; z-index: 10; max-width: min(480px, calc(100vw - 32px)); padding: 10px 13px; color: var(--ink); background: var(--raised); border: 1px solid var(--edge); border-radius: 7px; opacity: 0; pointer-events: none; transform: translateY(8px); transition: .18s ease; }
+  #session-list { height: 100%; overflow: auto; padding: 12px; }
+  .drawer-empty { padding: 28px 12px; color: var(--muted); text-align: center; }
+  .drawer-session { display: block; padding: 12px 13px; color: #d7d7da; border: 1px solid transparent; border-radius: 9px; text-decoration: none; transition: background .14s ease, border-color .14s ease, color .14s ease; }
+  .drawer-session + .drawer-session { margin-top: 3px; }
+  .drawer-session:hover, .drawer-session:focus-visible { color: #fff; background: var(--raised); border-color: #252525; outline: none; }
+  .drawer-session.active { color: #fff; background: #151515; border-color: #303030; box-shadow: inset 2px 0 0 #e5e5e5; }
+  .drawer-session strong { display: block; overflow: hidden; font-size: 13px; font-weight: 560; text-overflow: ellipsis; white-space: nowrap; }
+  .drawer-session span { display: block; margin-top: 3px; color: #8b8b91; font-size: 11px; }
+  #toast { position: fixed; right: 16px; bottom: 16px; z-index: 10; max-width: min(480px, calc(100vw - 32px)); padding: 10px 13px; color: var(--ink); background: #111e; border: 1px solid #292929; border-radius: 9px; box-shadow: 0 16px 50px #000c; opacity: 0; pointer-events: none; transform: translateY(8px); transition: .18s ease; backdrop-filter: blur(16px); }
   #toast.show { opacity: 1; transform: translateY(0); }
   #toast.error { border-color: var(--bad); }
-  @media (max-width: 520px) { #status-text { display: none; } header h1 { font-size: 12px; } }
+  @media (max-width: 520px) { header h1 { font-size: 12px; } }
   @media (prefers-reduced-motion: reduce) { #drawer-backdrop, #session-drawer, #toast { transition: none; } }
 </style>
 </head>
@@ -423,12 +431,10 @@ function shellHtml(nonce: string) {
     <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2.25" y="2.25" width="13.5" height="13.5" rx="2"></rect><path d="M6.25 2.5v13M9.25 6h3.5M9.25 9h3.5M9.25 12h2.25"></path></svg>
   </button>
   <h1>opencode generative UI</h1>
-  <span id="status"><span id="dot"></span><span id="status-text">connecting</span></span>
 </header>
 <main id="main"></main>
 <div id="drawer-backdrop"></div>
 <aside id="session-drawer" aria-hidden="true" aria-label="Sessions">
-  <div class="drawer-head"><strong>Sessions</strong><button id="drawer-close" type="button" aria-label="Close sessions">Close</button></div>
   <nav id="session-list" aria-label="OpenCode sessions"></nav>
 </aside>
 <div id="toast" role="status" aria-live="polite"></div>
@@ -446,8 +452,6 @@ function shellHtml(nonce: string) {
   var reconnectTimer;
   var toastTimer;
   var main = document.getElementById("main");
-  var dot = document.getElementById("dot");
-  var statusText = document.getElementById("status-text");
   var sessionToggle = document.getElementById("session-toggle");
   var sessionDrawer = document.getElementById("session-drawer");
   var drawerBackdrop = document.getElementById("drawer-backdrop");
@@ -475,13 +479,22 @@ function shellHtml(nonce: string) {
     return id;
   }
 
-  function orderedCanvases() {
-    return Object.keys(canvases).map(function (id) { return canvases[id]; }).sort(function (a, b) { return b.updatedAt - a.updatedAt; });
+  function orderedSessions() {
+    return sessions.slice().sort(function (a, b) { return b.updatedAt - a.updatedAt; });
+  }
+
+  function isCurrentSession(session) {
+    try {
+      var target = new URL(session.url, location.href);
+      return target.origin === location.origin && target.pathname === location.pathname;
+    } catch (_) {
+      return false;
+    }
   }
 
   function renderDrawer() {
     sessionList.replaceChildren();
-    var current = orderedCanvases();
+    var current = orderedSessions();
     if (!current.length) {
       var empty = document.createElement("div");
       empty.className = "drawer-empty";
@@ -489,15 +502,16 @@ function shellHtml(nonce: string) {
       sessionList.appendChild(empty);
       return;
     }
-    current.forEach(function (canvas) {
+    current.forEach(function (session) {
+      var active = isCurrentSession(session);
       var link = document.createElement("a");
-      link.className = "drawer-session" + (canvas.sessionID === currentSession ? " active" : "");
-      link.href = "/s/" + encodeURIComponent(canvas.sessionID) + "?token=" + encodeURIComponent(token);
-      if (canvas.sessionID === currentSession) link.setAttribute("aria-current", "page");
+      link.className = "drawer-session" + (active ? " active" : "");
+      link.href = session.url;
+      if (active) link.setAttribute("aria-current", "page");
       var title = document.createElement("strong");
-      title.textContent = sessionTitle(canvas.sessionID);
+      title.textContent = session.title;
       var meta = document.createElement("span");
-      meta.textContent = canvas.sessionID === currentSession ? "Current session" : "Open session";
+      meta.textContent = session.id;
       link.append(title, meta);
       sessionList.appendChild(link);
     });
@@ -510,16 +524,17 @@ function shellHtml(nonce: string) {
     sessionToggle.setAttribute("aria-expanded", String(open));
     sessionToggle.setAttribute("aria-label", open ? "Close sessions" : "Open sessions");
     document.body.classList.toggle("drawer-open", open);
-    if (open) document.getElementById("drawer-close").focus();
-    else sessionToggle.focus();
+    var firstSession = sessionList.querySelector("a");
+    if (open && firstSession) firstSession.focus();
+    else if (!open) sessionToggle.focus();
   }
 
   function renderIndex() {
     main.replaceChildren();
-    var current = orderedCanvases();
+    var current = orderedSessions();
     renderDrawer();
     if (current.length) {
-      location.replace("/s/" + encodeURIComponent(current[0].sessionID) + "?token=" + encodeURIComponent(token));
+      location.replace(current[0].url);
       return;
     }
     var empty = document.createElement("div");
@@ -639,7 +654,6 @@ function shellHtml(nonce: string) {
   }
 
   sessionToggle.addEventListener("click", function () { setDrawer(sessionToggle.getAttribute("aria-expanded") !== "true"); });
-  document.getElementById("drawer-close").addEventListener("click", function () { setDrawer(false); });
   drawerBackdrop.addEventListener("click", function () { setDrawer(false); });
   addEventListener("keydown", function (event) { if (event.key === "Escape" && sessionDrawer.classList.contains("open")) setDrawer(false); });
   addEventListener("message", function (event) {
@@ -656,8 +670,7 @@ function shellHtml(nonce: string) {
     var url = protocol + "//" + location.host + "/ws?token=" + encodeURIComponent(token);
     if (currentSession) url += "&session=" + encodeURIComponent(currentSession);
     ws = new WebSocket(url);
-    ws.onopen = function () { dot.className = "on"; statusText.textContent = "live"; };
-    ws.onclose = function () { dot.className = ""; statusText.textContent = "reconnecting"; reconnectTimer = setTimeout(connect, 1500); };
+    ws.onclose = function () { reconnectTimer = setTimeout(connect, 1500); };
     ws.onmessage = function (event) {
       var message;
       try { message = JSON.parse(event.data); } catch (_) { return; }
@@ -666,20 +679,15 @@ function shellHtml(nonce: string) {
         message.canvases.forEach(function (canvas) { canvases[canvas.sessionID] = canvas; });
         sessions = message.sessions;
         render();
+      } else if (message.type === "sessions") {
+        sessions = message.sessions;
+        if (currentSession) renderDrawer();
+        else renderIndex();
       } else if (message.type === "session-canvas") {
         if (message.canvas) canvases[message.sessionID] = message.canvas;
         else delete canvases[message.sessionID];
         if (message.sessionID === currentSession) renderSession(true);
         else renderDrawer();
-      } else if (message.type === "session") {
-        var replaced = false;
-        sessions = sessions.map(function (session) {
-          if (session.id !== message.session.id) return session;
-          replaced = true;
-          return message.session;
-        });
-        if (!replaced) sessions.push(message.session);
-        renderDrawer();
       } else if (message.type === "session-remove") {
         delete canvases[message.sessionID];
         if (message.sessionID === currentSession) renderSession(false);
@@ -703,12 +711,16 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
   const config = readConfig(worktree, options)
   const authToken = randomToken()
   const shellNonce = randomToken(18)
+  const instanceID = `${process.pid}-${randomToken(9)}`
+  const registryDirectory = path.join(config.canvasDirectory, ".panels")
+  const registryFile = path.join(registryDirectory, `${instanceID}.json`)
+  const browserLockFile = path.join(registryDirectory, ".browser-lock")
   const canvases = new Map<string, Canvas>()
   const knownSessions = new Set<string>()
   const sessionAgents = new Map<string, string>()
-  const sessionShellTokens = new Map<string, string>()
   const sessionFrameTokens = new Map<string, string>()
   const sessionTitles = new Map<string, string>()
+  const peerPanels = new Map<string, PanelRegistry>()
   const sockets = new Set<PanelSocket>()
   const submissionQueues = new Map<string, Submission[]>()
   const sessionStatus = new Map<string, "idle" | "busy" | "unknown">()
@@ -720,10 +732,16 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
   let panelOrigin: string | null = null
   let serveError: string | null = null
   let openedBrowser = false
+  let ownsBrowserLock = false
   let disposed = false
   let sharedStyles = ""
   let canvasWatcher: FSWatcher | null = null
+  let registryWatcher: FSWatcher | null = null
   let refreshTimer: ReturnType<typeof setTimeout> | null = null
+  let registryRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  let heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  let registryWrite = Promise.resolve()
+  let sessionsSignature = ""
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: "opencode-generative-ui", level, message, extra } }).catch(() => {})
@@ -762,9 +780,7 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
   }
 
   const broadcastToSession = (sessionID: string, message: ServerMessage) => {
-    for (const socket of sockets) {
-      if (socket.data.sessionID === null || socket.data.sessionID === sessionID) send(socket, message)
-    }
+    for (const socket of sockets) send(socket, message)
   }
 
   const broadcastCanvas = (sessionID: string) => {
@@ -794,16 +810,11 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
 
   const sessionURL = (sessionID: string) => {
     if (!panelOrigin) return null
-    let token = sessionShellTokens.get(sessionID)
-    if (!token) {
-      token = randomToken()
-      sessionShellTokens.set(sessionID, token)
-    }
-    return `${panelOrigin}${sessionPath(sessionID)}?token=${encodeURIComponent(token)}`
+    return `${panelOrigin}${sessionPath(sessionID)}?token=${encodeURIComponent(authToken)}`
   }
 
-  const openBrowser = (url: string) => {
-    if (openedBrowser || !config.autoOpen) return
+  const openBrowser = async (url: string) => {
+    if (openedBrowser || !config.autoOpen || !await claimBrowserOwnership()) return
     openedBrowser = true
     try {
       let command: string
@@ -814,7 +825,11 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
           ? config.browserCommand.replaceAll("{url}", quotedURL)
           : `${config.browserCommand} ${quotedURL}`
         const child = spawn(command, { detached: true, shell: true, stdio: "ignore" })
-        child.on("error", (error) => log("warn", "custom browser command failed", { error: String(error), url }))
+        child.on("error", (error) => {
+          openedBrowser = false
+          void releaseBrowserOwnership()
+          log("warn", "custom browser command failed", { error: String(error), url })
+        })
         child.unref()
         return
       }
@@ -829,9 +844,15 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
         args = [url]
       }
       const child = spawn(command, args, { detached: true, stdio: "ignore" })
-      child.on("error", (error) => log("warn", "browser command failed", { error: String(error), url }))
+      child.on("error", (error) => {
+        openedBrowser = false
+        void releaseBrowserOwnership()
+        log("warn", "browser command failed", { error: String(error), url })
+      })
       child.unref()
     } catch (error) {
+      openedBrowser = false
+      void releaseBrowserOwnership()
       log("warn", "could not open the UI panel browser", { error: String(error), url })
     }
   }
@@ -877,18 +898,24 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
         restored,
       }
       canvases.set(sessionID, canvas)
-      broadcastToSession(sessionID, { type: "session", session: { id: sessionID, title: canvas.sessionTitle } })
       broadcastCanvas(sessionID)
+      broadcastSessions()
+      await writeRegistry()
       if (!restored) {
+        await loadRegistry()
         const url = sessionURL(sessionID)
-        if (url) openBrowser(url)
+        if (url) await openBrowser(url)
       }
       return true
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? error.code : null
       if (!isCurrent()) return false
       if (code === "ENOENT") {
-        if (canvases.delete(sessionID)) broadcastCanvas(sessionID)
+        if (canvases.delete(sessionID)) {
+          broadcastCanvas(sessionID)
+          broadcastSessions()
+          await writeRegistry()
+        }
       } else {
         log("warn", "failed to load session UI file", { sessionID, file, error: String(error) })
         for (const socket of sockets) {
@@ -932,12 +959,197 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
   if (realRelative === ".." || realRelative.startsWith(`..${path.sep}`) || path.isAbsolute(realRelative)) {
     throw new Error(`UI directory resolves outside the project worktree: ${realCanvasDirectory}`)
   }
+  await mkdir(registryDirectory, { recursive: true, mode: 0o700 })
+  const realRegistryDirectory = await realpath(registryDirectory)
+  const registryRelative = path.relative(realCanvasDirectory, realRegistryDirectory)
+  if (registryRelative === ".." || registryRelative.startsWith(`..${path.sep}`) || path.isAbsolute(registryRelative)) {
+    throw new Error(`Panel registry resolves outside the UI directory: ${realRegistryDirectory}`)
+  }
+
+  const assertRegistryDirectory = async () => {
+    if (await realpath(registryDirectory) !== realRegistryDirectory) throw new Error("Panel registry directory changed after plugin startup")
+  }
+
+  const localSessionSummaries = (): SessionSummary[] =>
+    [...canvases.values()].map((canvas) => ({
+      key: `${instanceID}:${canvas.sessionID}`,
+      id: canvas.sessionID,
+      title: sessionTitles.get(canvas.sessionID) ?? canvas.sessionTitle,
+      url: sessionURL(canvas.sessionID) ?? "",
+      updatedAt: canvas.updatedAt,
+    })).filter((session) => session.url)
+
+  const sessionsForClient = () => {
+    const sessions = localSessionSummaries()
+    for (const panel of peerPanels.values()) sessions.push(...panel.sessions)
+    return sessions.toSorted((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  const broadcastSessions = () => {
+    const sessions = sessionsForClient()
+    const signature = JSON.stringify(sessions)
+    if (signature === sessionsSignature) return
+    sessionsSignature = signature
+    for (const socket of sockets) send(socket, { type: "sessions", sessions })
+  }
+
+  const writeRegistry = () => {
+    registryWrite = registryWrite.catch(() => {}).then(async () => {
+      if (disposed || !panelOrigin) return
+      await assertRegistryDirectory()
+      const record: PanelRegistry = {
+        version: 1,
+        instanceID,
+        pid: process.pid,
+        updatedAt: Date.now(),
+        sessions: localSessionSummaries(),
+      }
+      const temporary = `${registryFile}.${randomToken(6)}.tmp`
+      await writeFile(temporary, JSON.stringify(record), { encoding: "utf8", mode: 0o600 })
+      await rename(temporary, registryFile)
+      await chmod(registryFile, 0o600).catch(() => {})
+    }).catch((error) => { log("warn", "failed to update panel registry", { error: String(error) }) })
+    return registryWrite
+  }
+
+  const loadRegistry = async () => {
+    const next = new Map<string, PanelRegistry>()
+    try {
+      await assertRegistryDirectory()
+      const entries = await readdir(registryDirectory, { withFileTypes: true })
+      await Promise.all(entries.map(async (entry) => {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) return
+        const file = path.join(registryDirectory, entry.name)
+        try {
+          const info = await stat(file)
+          if (info.size > 1_000_000) throw new Error("registry record is too large")
+          const parsed = JSON.parse(await readFile(file, "utf8")) as Partial<PanelRegistry>
+          if (
+            parsed.version !== 1 ||
+            typeof parsed.instanceID !== "string" ||
+            !Number.isInteger(parsed.pid) ||
+            typeof parsed.updatedAt !== "number" ||
+            !Array.isArray(parsed.sessions)
+          ) throw new Error("invalid registry record")
+          if (Date.now() - parsed.updatedAt > REGISTRY_STALE_MS) {
+            if (parsed.instanceID !== instanceID) await rm(file, { force: true }).catch(() => {})
+            return
+          }
+          if (parsed.instanceID === instanceID) return
+          const sessions: SessionSummary[] = []
+          for (const item of parsed.sessions) {
+            if (!item || typeof item.id !== "string" || typeof item.title !== "string" || typeof item.url !== "string" || typeof item.updatedAt !== "number") continue
+            try {
+              const url = new URL(item.url)
+              if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.pathname !== sessionPath(item.id)) continue
+              sessions.push({
+                key: `${parsed.instanceID}:${item.id}`,
+                id: item.id,
+                title: item.title.slice(0, 200),
+                url: url.href,
+                updatedAt: item.updatedAt,
+              })
+            } catch {}
+          }
+          next.set(parsed.instanceID, { ...parsed, version: 1, sessions } as PanelRegistry)
+        } catch (error) {
+          log("debug", "ignored invalid panel registry record", { file, error: String(error) })
+        }
+      }))
+    } catch (error) {
+      log("warn", "failed to read panel registry", { error: String(error) })
+    }
+    peerPanels.clear()
+    for (const [id, panel] of next) peerPanels.set(id, panel)
+    broadcastSessions()
+  }
+
+  const registryOwnerIsLive = async (owner: string) => {
+    if (owner === instanceID || peerPanels.has(owner)) return true
+    if (!/^[a-zA-Z0-9_-]+$/.test(owner)) return false
+    try {
+      await assertRegistryDirectory()
+      const file = path.join(registryDirectory, `${owner}.json`)
+      const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+      try {
+        const info = await handle.stat()
+        if (!info.isFile() || info.size > 1_000_000) return false
+        const record = JSON.parse(await handle.readFile("utf8")) as Partial<PanelRegistry>
+        return record.instanceID === owner && typeof record.updatedAt === "number" && Date.now() - record.updatedAt <= REGISTRY_STALE_MS
+      } finally {
+        await handle.close()
+      }
+    } catch {
+      return false
+    }
+  }
+
+  const claimBrowserOwnership = async () => {
+    if (ownsBrowserLock) return true
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      await assertRegistryDirectory()
+      try {
+        const handle = await open(browserLockFile, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL, 0o600)
+        try {
+          await handle.writeFile(JSON.stringify({ instanceID, claimedAt: Date.now() }))
+        } finally {
+          await handle.close()
+        }
+        ownsBrowserLock = true
+        return true
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error ? error.code : null
+        if (code !== "EEXIST") throw error
+      }
+      let owner = ""
+      try {
+        const handle = await open(browserLockFile, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+        try {
+          const info = await handle.stat()
+          if (!info.isFile() || info.size > 10_000) throw new Error("invalid browser lock")
+          const parsed = JSON.parse(await handle.readFile("utf8")) as { instanceID?: unknown }
+          if (typeof parsed.instanceID === "string") owner = parsed.instanceID
+        } finally {
+          await handle.close()
+        }
+      } catch {}
+      if (owner && await registryOwnerIsLive(owner)) return owner === instanceID
+      await assertRegistryDirectory()
+      await rm(browserLockFile, { force: true }).catch(() => {})
+    }
+    return false
+  }
+
+  const releaseBrowserOwnership = async () => {
+    if (!ownsBrowserLock) return
+    ownsBrowserLock = false
+    try {
+      await assertRegistryDirectory()
+      const parsed = JSON.parse(await readFile(browserLockFile, "utf8")) as { instanceID?: unknown }
+      if (parsed.instanceID === instanceID) await rm(browserLockFile, { force: true })
+    } catch {}
+  }
+
+  const scheduleRegistryRefresh = () => {
+    if (registryRefreshTimer) clearTimeout(registryRefreshTimer)
+    registryRefreshTimer = setTimeout(() => {
+      registryRefreshTimer = null
+      void loadRegistry()
+    }, 50)
+  }
+
   await loadSharedStyles()
   try {
     canvasWatcher = watch(config.canvasDirectory, scheduleRefresh)
     canvasWatcher.on("error", (error) => log("warn", "UI file watcher failed", { error: String(error) }))
   } catch (error) {
     log("warn", "could not watch UI directory", { directory: config.canvasDirectory, error: String(error) })
+  }
+  try {
+    registryWatcher = watch(registryDirectory, scheduleRegistryRefresh)
+    registryWatcher.on("error", (error) => log("warn", "panel registry watcher failed", { error: String(error) }))
+  } catch (error) {
+    log("warn", "could not watch panel registry", { directory: registryDirectory, error: String(error) })
   }
 
   const promptText = (text: string, data: unknown, hasData: boolean) => {
@@ -1006,7 +1218,6 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
     sessionStatus.delete(sessionID)
     sessionAgents.delete(sessionID)
     sessionTitles.delete(sessionID)
-    sessionShellTokens.delete(sessionID)
     sessionFrameTokens.delete(sessionID)
     try {
       if (await realpath(config.canvasDirectory) !== realCanvasDirectory) throw new Error("UI directory changed after plugin startup")
@@ -1015,6 +1226,8 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
       log("warn", "failed to remove session UI file", { sessionID, file: canvasFile(sessionID), error: String(error) })
     }
     broadcastToSession(sessionID, { type: "session-remove", sessionID })
+    broadcastSessions()
+    await writeRegistry()
   }
 
   const handleMessage = async (socket: PanelSocket, raw: unknown) => {
@@ -1069,17 +1282,11 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
       fetch(req: Request, server: { upgrade(request: Request, options: { data: SocketData }): boolean }) {
         const url = new URL(req.url)
         if (url.pathname === "/ws") {
-          const token = url.searchParams.get("token")
           const requestedSession = url.searchParams.get("session")
-          const tokenSession = [...sessionShellTokens.entries()].find((entry) => entry[1] === token)?.[0] ?? null
-          if (
-            req.headers.get("origin") !== panelOrigin ||
-            (token !== authToken && !tokenSession) ||
-            (tokenSession && requestedSession && requestedSession !== tokenSession)
-          ) {
+          if (req.headers.get("origin") !== panelOrigin || url.searchParams.get("token") !== authToken) {
             return new Response("forbidden", { status: 403 })
           }
-          return server.upgrade(req, { data: { sessionID: tokenSession ?? requestedSession } })
+          return server.upgrade(req, { data: { sessionID: requestedSession } })
             ? undefined
             : new Response("upgrade failed", { status: 400 })
         }
@@ -1108,13 +1315,9 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
         }
         const sessionMatch = url.pathname.match(/^\/s\/([^/]+)$/)
         if (url.pathname !== "/" && !sessionMatch) return new Response("not found", { status: 404 })
-        const token = url.searchParams.get("token")
+        if (url.searchParams.get("token") !== authToken) return new Response("forbidden", { status: 403 })
         if (sessionMatch) {
-          let sessionID: string
-          try { sessionID = decodeURIComponent(sessionMatch[1]) } catch { return new Response("bad session", { status: 400 }) }
-          if (token !== authToken && token !== sessionShellTokens.get(sessionID)) return new Response("forbidden", { status: 403 })
-        } else if (token !== authToken) {
-          return new Response("forbidden", { status: 403 })
+          try { decodeURIComponent(sessionMatch[1]) } catch { return new Response("bad session", { status: 400 }) }
         }
         const html = shellHtml(shellNonce)
         const connectSource = panelOrigin ? `${panelOrigin.replace("http:", "ws:")} ${panelOrigin}` : "'self'"
@@ -1134,11 +1337,7 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
         idleTimeout: 120,
         open(socket: PanelSocket) {
           sockets.add(socket)
-          const visible = socket.data.sessionID
-            ? [...canvases.values()].filter((canvas) => canvas.sessionID === socket.data.sessionID)
-            : [...canvases.values()]
-          const sessions = visible.map((canvas) => ({ id: canvas.sessionID, title: sessionTitles.get(canvas.sessionID) ?? canvas.sessionID }))
-          send(socket, { type: "init", canvases: visible.map(canvasForClient), sessions })
+          send(socket, { type: "init", canvases: [...canvases.values()].map(canvasForClient), sessions: sessionsForClient() })
         },
         close(socket: PanelSocket) {
           sockets.delete(socket)
@@ -1166,6 +1365,13 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
     serveError = `UI panel server failed to start: ${String(error)}`
     log("error", serveError)
   }
+  await writeRegistry()
+  await loadRegistry()
+  heartbeatTimer = setInterval(() => {
+    void writeRegistry()
+    void loadRegistry()
+  }, REGISTRY_HEARTBEAT_MS)
+  heartbeatTimer.unref?.()
 
   const instructionsFor = (sessionID: string) => {
     const file = canvasFile(sessionID)
@@ -1186,14 +1392,22 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
     dispose: async () => {
       disposed = true
       canvasWatcher?.close()
+      registryWatcher?.close()
       if (refreshTimer) clearTimeout(refreshTimer)
       refreshTimer = null
+      if (registryRefreshTimer) clearTimeout(registryRefreshTimer)
+      registryRefreshTimer = null
+      if (heartbeatTimer) clearInterval(heartbeatTimer)
+      heartbeatTimer = null
       for (const timer of retryTimers) clearTimeout(timer)
       retryTimers.clear()
       for (const socket of sockets) {
         try { socket.close(1001, "plugin disposed") } catch {}
       }
       sockets.clear()
+      await registryWrite
+      await releaseBrowserOwnership()
+      await rm(registryFile, { force: true }).catch(() => {})
       if (panelServer) await Promise.resolve(panelServer.stop(true)).catch(() => {})
       panelServer = null
     },
@@ -1206,7 +1420,8 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
           sessionTitles.set(info.id, info.title)
           const canvas = canvases.get(info.id)
           if (canvas) canvas.sessionTitle = info.title
-          broadcastToSession(info.id, { type: "session", session: { id: info.id, title: info.title } })
+          broadcastSessions()
+          await writeRegistry()
         }
       }
       if (event.type === "session.status") {
