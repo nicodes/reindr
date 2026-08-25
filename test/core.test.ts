@@ -35,6 +35,9 @@ test("session routing, direct interaction delivery, persistence, and HTTP securi
     html: `<button onclick="sendPrompt('apply')">Apply</button>`,
   }, first.context)
   await render({ id: "status", title: "Status", html: "<p>Ready</p>" }, first.context)
+  await hooks.tool!.widget_layout.execute({
+    css: `#oc-root { grid-template-columns: 2fr 1fr; } [data-widget-id="settings"] { order: 2; }`,
+  }, first.context)
   assert.equal(first.asks.length, 1, "render permission is requested once per session")
 
   const second = fakeContext("session-b")
@@ -61,11 +64,16 @@ test("session routing, direct interaction delivery, persistence, and HTTP securi
   const frameResponse = await fetch(new URL(widget.frameURL, panelURL))
   assert.equal(frameResponse.status, 200)
   assert.match(frameResponse.headers.get("content-security-policy") ?? "", /connect-src 'none'/)
-  assert.match(await frameResponse.text(), /sendPrompt|Content-Security-Policy/)
+  const frameDocument = await frameResponse.text()
+  assert.match(frameDocument, /sendPrompt|Content-Security-Policy/)
+  assert.match(frameDocument, /data-widget-id="settings"/)
+  assert.match(frameDocument, /data-widget-id="status"/)
+  assert.match(frameDocument, /grid-template-columns: 2fr 1fr/)
+  assert.match(frameDocument, /--ui-accent/)
 
-  socket.send(JSON.stringify({ type: "data", key: widget.key, data: { dryRun: true } }))
+  socket.send(JSON.stringify({ type: "data", id: widget.id, data: { dryRun: true } }))
   const queuedPromise = nextMessage(socket, (message) => message.type === "submission-status" && message.status === "queued")
-  socket.send(JSON.stringify({ type: "submit", key: widget.key, text: "Apply settings" }))
+  socket.send(JSON.stringify({ type: "submit", id: widget.id, text: "Apply settings" }))
   await queuedPromise
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.equal(fake.prompts.length, 0, "busy sessions do not receive prompts")

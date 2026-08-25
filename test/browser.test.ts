@@ -1,5 +1,5 @@
 import assert from "node:assert/strict"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import test from "node:test"
@@ -10,6 +10,8 @@ import { fakeClient, fakeContext, freePort, installBunServeAdapter, parsePanelUR
 test("Chromium renders a sandboxed view and sends a user-activated interaction", async (t) => {
   const restoreBun = installBunServeAdapter()
   const stateDirectory = await mkdtemp(path.join(tmpdir(), "opencode-generative-ui-browser-"))
+  const stylesheetPath = path.join(stateDirectory, "shared.css")
+  await writeFile(stylesheetPath, `:root { --test-shared-style: loaded; }`)
   const port = await freePort()
   const fake = fakeClient("idle")
   const pluginInput = {
@@ -21,7 +23,8 @@ test("Chromium renders a sandboxed view and sends a user-activated interaction",
     experimental_workspace: { register() {} },
     $: undefined as never,
   }
-  let hooks = await plugin(pluginInput, { port, autoOpen: false, stateDirectory })
+  const pluginOptions = { port, autoOpen: false, stateDirectory, stylesheetPath }
+  let hooks = await plugin(pluginInput, pluginOptions)
   const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true })
 
   t.after(async () => {
@@ -51,6 +54,14 @@ test("Chromium renders a sandboxed view and sends a user-activated interaction",
         });
       </script>`,
   }, context.context)
+  await hooks.tool!.widget_render.execute({
+    id: "summary-panel",
+    title: "Summary",
+    html: `<aside id="summary">Original summary</aside>`,
+  }, context.context)
+  await hooks.tool!.widget_layout.execute({
+    css: `#oc-root { grid-template-columns: 2fr 1fr; min-height: 1600px; } [data-widget-id="refactor-form"] { min-width: 0; }`,
+  }, context.context)
   const otherContext = fakeContext("second-session")
   await hooks.tool!.widget_render.execute({
     id: "secondary-view",
@@ -66,10 +77,10 @@ test("Chromium renders a sandboxed view and sends a user-activated interaction",
   page.on("pageerror", (error) => pageErrors.push(error.message))
   page.on("console", (message) => consoleMessages.push(message.text()))
   await page.goto(panelURL.href)
-  await page.locator('iframe[title="Refactor options"]').waitFor({ state: "attached", timeout: 5_000 }).catch(async (error) => {
+  await page.locator('iframe[title="Session browser-session"]').waitFor({ state: "attached", timeout: 5_000 }).catch(async (error) => {
     throw new Error(`${String(error)}\nPage errors: ${pageErrors.join(" | ")}\nBody: ${await page.locator("body").innerText()}`)
   })
-  const frame = page.frameLocator('iframe[title="Refactor options"]')
+  const frame = page.frameLocator('iframe[title="Session browser-session"]')
   await new Promise((resolve) => setTimeout(resolve, 500))
   assert.equal(await page.locator(".card, .bar, .rail").count(), 0, "the shell adds no widget card chrome")
   const headerText = await page.locator("header").innerText()
@@ -77,7 +88,7 @@ test("Chromium renders a sandboxed view and sends a user-activated interaction",
   const viewBounds = await page.locator(".agent-view").boundingBox()
   assert.equal(viewBounds?.x, 0)
   assert.equal(viewBounds?.width, 1000)
-  const iframeBounds = await page.locator('iframe[title="Refactor options"]').boundingBox()
+  const iframeBounds = await page.locator('iframe[title="Session browser-session"]').boundingBox()
   assert.ok((iframeBounds?.height ?? 0) >= 752, "a lone generated view fills the region beneath the header")
 
   const sessionToggle = page.locator("#session-toggle")
@@ -99,17 +110,38 @@ test("Chromium renders a sandboxed view and sends a user-activated interaction",
 
   const networkStatus = await frame.locator("#network").textContent()
   assert.equal(networkStatus, "network blocked", `Widget page errors: ${pageErrors.join(" | ")} Console: ${consoleMessages.join(" | ")}`)
+  assert.equal(await frame.locator('[data-widget-id="refactor-form"]').count(), 1)
+  assert.equal(await frame.locator('[data-widget-id="summary-panel"]').count(), 1)
+  assert.equal(await frame.locator("#oc-root").evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(" ").length), 2)
+  assert.equal(await frame.locator(":root").evaluate((element) => getComputedStyle(element).getPropertyValue("--test-shared-style").trim()), "loaded")
+
+  const nameInput = frame.locator('input[name="name"]')
+  await nameInput.fill("PreservedByComposer")
+  await nameInput.focus()
+  await page.evaluate(() => scrollTo(0, 280))
+  assert.ok(await page.evaluate(() => scrollY >= 250))
+  await hooks.tool!.widget_render.execute({
+    id: "summary-panel",
+    title: "Summary",
+    html: `<aside id="summary">Updated summary</aside>`,
+  }, context.context)
+  await frame.getByText("Updated summary").waitFor()
+  assert.equal(await frame.locator('input[name="name"]').inputValue(), "PreservedByComposer", "form state survives a composed document update")
+  assert.equal(await frame.locator('input[name="name"]').evaluate((element) => document.activeElement === element), true, "focus survives a composed document update")
+  await page.waitForFunction(() => scrollY >= 250)
+  assert.ok(await page.evaluate(() => scrollY >= 250), "page scroll survives a composed document update")
+
   assert.equal(await page.getByRole("dialog").count(), 0, "the shell has no interaction popup")
   await frame.getByRole("button", { name: "Submit" }).click()
   await page.getByText(/was sent to the agent/).waitFor()
   assert.equal(fake.prompts.length, 1)
   assert.equal(fake.prompts[0].path.id, "browser-session")
   assert.match(fake.prompts[0].body.parts[0].text, /Apply refactor options/)
-  assert.match(fake.prompts[0].body.parts[0].text, /WidgetAPI/)
+  assert.match(fake.prompts[0].body.parts[0].text, /PreservedByComposer/)
 
   await page.close()
   await hooks.dispose?.()
-  hooks = await plugin(pluginInput, { port, autoOpen: false, stateDirectory })
+  hooks = await plugin(pluginInput, pluginOptions)
   const list = String(await hooks.tool!.widget_list.execute({}, context.context))
   const restoredURL = list.match(/Panel: (https?:\/\/\S+)/)?.[1]
   assert.ok(restoredURL)
@@ -119,6 +151,9 @@ test("Chromium renders a sandboxed view and sends a user-activated interaction",
   await restoredPage.getByRole("button", { name: "Activate saved content" }).waitFor()
   assert.equal(await restoredPage.locator("iframe").count(), 0, "restored scripts do not run before activation")
   await restoredPage.getByRole("button", { name: "Activate saved content" }).click()
-  await restoredPage.locator('iframe[title="Refactor options"]').waitFor({ state: "attached" })
+  await restoredPage.locator('iframe[title="Session browser-session"]').waitFor({ state: "attached" })
+  const restoredFrame = restoredPage.frameLocator('iframe[title="Session browser-session"]')
+  assert.equal(await restoredFrame.locator("[data-widget-id]").count(), 2)
+  assert.equal(await restoredFrame.locator("#oc-root").evaluate((element) => getComputedStyle(element).gridTemplateColumns.split(" ").length), 2)
   await restoredPage.close()
 })

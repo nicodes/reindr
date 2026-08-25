@@ -8,7 +8,6 @@ import { tool } from "@opencode-ai/plugin"
 
 type Widget = {
   key: string
-  frameToken: string
   id: string
   sessionID: string
   sessionTitle: string
@@ -23,6 +22,11 @@ type Widget = {
 type SessionSummary = {
   id: string
   title: string
+}
+
+type SessionLayout = {
+  css: string
+  updatedAt: number
 }
 
 type DataEvent = {
@@ -53,26 +57,26 @@ type PanelServer = {
   stop(closeActiveConnections?: boolean): unknown
 }
 
-type ClientWidget = Omit<Widget, "html" | "frameToken"> & {
+type ClientWidget = Omit<Widget, "html"> & {
   frameURL: string
 }
 
 type ServerMessage =
   | { type: "init"; widgets: ClientWidget[]; sessions: SessionSummary[] }
-  | { type: "widget"; widget: ClientWidget }
-  | { type: "remove"; key: string }
+  | { type: "session-widgets"; sessionID: string; widgets: ClientWidget[] }
   | { type: "session"; session: SessionSummary }
   | { type: "session-remove"; sessionID: string }
   | { type: "submission-status"; id: string; status: "queued" | "sent" | "failed"; message: string }
   | { type: "notice"; level: "info" | "error"; message: string }
 
 type ClientMessage =
-  | { type: "data"; key: string; data: unknown }
-  | { type: "submit"; key: string; text: string }
+  | { type: "data"; id: string; data: unknown }
+  | { type: "submit"; id: string; text: string }
 
 type PersistedState = {
-  version: 1
-  widgets: Array<Omit<Widget, "restored" | "frameToken">>
+  version: 2
+  widgets: Array<Omit<Widget, "restored">>
+  layouts: Record<string, SessionLayout>
 }
 
 type Config = {
@@ -81,6 +85,7 @@ type Config = {
   browserCommand: string | null
   stateDirectory: string
   allowedAssetOrigins: string[]
+  stylesheetPath: string | null
 }
 
 const DEFAULT_PORT = 4917
@@ -88,6 +93,8 @@ const MAX_WIDGET_HTML_BYTES = 400_000
 const MAX_TOTAL_WIDGET_HTML_BYTES = 10_000_000
 const MAX_WIDGETS_PER_SESSION = 50
 const MAX_WIDGETS_TOTAL = 200
+const MAX_STYLESHEET_BYTES = 200_000
+const MAX_TOTAL_LAYOUT_BYTES = 2_000_000
 const MAX_DATA_BYTES = 64_000
 const MAX_DATA_EVENTS_PER_WIDGET = 100
 const MAX_PENDING_SUBMISSIONS = 100
@@ -153,6 +160,12 @@ function readConfig(options: PluginOptions | undefined): Config {
           ? options.stateDirectory
           : defaultStateDirectory(),
     allowedAssetOrigins: normalizeAssetOrigins([...allowedOption, ...allowedEnvironment]),
+    stylesheetPath:
+      typeof process.env.OPENCODE_WIDGET_STYLESHEET === "string"
+        ? process.env.OPENCODE_WIDGET_STYLESHEET
+        : typeof options?.stylesheetPath === "string"
+          ? options.stylesheetPath
+          : null,
   }
 }
 
@@ -206,7 +219,16 @@ const BRIDGE_HTML = `<script>
   function post(message) {
     parent.postMessage(Object.assign({ __ocw: 1 }, message), "*");
   }
-  window.sendPrompt = function (text) {
+  function sourceID(explicit) {
+    if (typeof explicit === "string" && explicit) return explicit;
+    var currentEvent = window.event;
+    var target = currentEvent && currentEvent.target instanceof Element ? currentEvent.target : document.activeElement;
+    var owner = target && target.closest ? target.closest("[data-widget-id]") : null;
+    if (owner) return owner.getAttribute("data-widget-id") || "";
+    var only = document.querySelectorAll("[data-widget-id]");
+    return only.length === 1 ? only[0].getAttribute("data-widget-id") || "" : "";
+  }
+  window.sendPrompt = function (text, id) {
     if (!navigator.userActivation || !navigator.userActivation.isActive) {
       post({ kind: "error", message: "sendPrompt() requires a user click or form submission." });
       return false;
@@ -214,11 +236,11 @@ const BRIDGE_HTML = `<script>
     var now = Date.now();
     if (now - sentAt < 500) return false;
     sentAt = now;
-    post({ kind: "prompt", text: String(text) });
+    post({ kind: "prompt", id: sourceID(id), text: String(text) });
     return true;
   };
-  window.sendData = function (data) {
-    post({ kind: "data", data: data });
+  window.sendData = function (data, id) {
+    post({ kind: "data", id: sourceID(id), data: data });
   };
   var manualHeight = false;
   window.setHeight = function (px) {
@@ -230,31 +252,136 @@ const BRIDGE_HTML = `<script>
     var root = document.documentElement;
     var body = document.body;
     var height = Math.max(root ? root.scrollHeight : 0, body ? body.scrollHeight : 0);
-    post({ kind: "resize", px: Math.min(Math.max(height, 120), 1600) });
+    post({ kind: "resize", px: Math.min(Math.max(height, 120), 5000) });
   }
+  function controlKey(control, index) {
+    var owner = control.closest("[data-widget-id]");
+    var prefix = owner ? owner.getAttribute("data-widget-id") || "" : "";
+    if (control.id) return prefix + "::id:" + control.id;
+    if (control.getAttribute("name")) return prefix + "::name:" + control.getAttribute("name") + ":" + index;
+    return prefix + "::index:" + index;
+  }
+  function captureState() {
+    var controls = Array.prototype.slice.call(document.querySelectorAll("input, textarea, select"));
+    var values = {};
+    controls.forEach(function (control, index) {
+      var value = { value: control.value };
+      if ("checked" in control) value.checked = control.checked;
+      if (control instanceof HTMLSelectElement) value.selectedIndex = control.selectedIndex;
+      values[controlKey(control, index)] = value;
+    });
+    var activeIndex = controls.indexOf(document.activeElement);
+    return {
+      controls: values,
+      active: activeIndex >= 0 ? controlKey(controls[activeIndex], activeIndex) : null,
+      scrollX: scrollX,
+      scrollY: scrollY
+    };
+  }
+  function restoreState(state) {
+    if (!state || !state.controls) return;
+    var controls = Array.prototype.slice.call(document.querySelectorAll("input, textarea, select"));
+    controls.forEach(function (control, index) {
+      var key = controlKey(control, index);
+      var value = state.controls[key];
+      if (!value) return;
+      if ("value" in value) control.value = value.value;
+      if ("checked" in value && "checked" in control) control.checked = value.checked;
+      if ("selectedIndex" in value && control instanceof HTMLSelectElement) control.selectedIndex = value.selectedIndex;
+      if (state.active === key) setTimeout(function () { control.focus(); }, 0);
+    });
+    requestAnimationFrame(function () { scrollTo(Number(state.scrollX) || 0, Number(state.scrollY) || 0); });
+  }
+  addEventListener("message", function (event) {
+    var data = event.data;
+    if (event.source !== parent || !data || data.__ocwParent !== 1) return;
+    if (data.kind === "capture-state") post({ kind: "state", requestID: data.requestID, state: captureState() });
+    if (data.kind === "restore-state") restoreState(data.state);
+  });
   addEventListener("DOMContentLoaded", function () {
     if ("ResizeObserver" in window) new ResizeObserver(autoHeight).observe(document.documentElement);
     autoHeight();
+    post({ kind: "ready" });
   });
   addEventListener("load", autoHeight);
   setTimeout(autoHeight, 300);
 })();
-</script>
-<style>
-  :root { color-scheme: dark; }
-  body { margin: 0; background: transparent; color: #ede6d8; font: 14px/1.55 ui-sans-serif, system-ui, sans-serif; }
-</style>`
+</script>`
 
-function widgetDocument(html: string, allowedAssetOrigins: string[]) {
+const DEFAULT_SHARED_CSS = `
+:root {
+  color-scheme: dark;
+  --ui-bg: #13110e;
+  --ui-surface: #1d1914;
+  --ui-surface-raised: #252019;
+  --ui-border: #393126;
+  --ui-text: #f0e9dc;
+  --ui-muted: #a69b8d;
+  --ui-accent: #f4b942;
+  --ui-danger: #e17161;
+  --ui-radius: 10px;
+  --ui-space: clamp(14px, 2vw, 24px);
+  font: 14px/1.55 ui-sans-serif, system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { min-height: 100%; }
+body { margin: 0; background: var(--ui-bg); color: var(--ui-text); }
+#oc-root {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
+  gap: var(--ui-space);
+  min-height: 100vh;
+  padding: var(--ui-space);
+}
+#oc-root > [data-widget-id] { min-width: 0; }
+#oc-root > [data-widget-id]:only-child { grid-column: 1 / -1; }
+:where(button, input, select, textarea) { font: inherit; }
+:where(input, select, textarea) {
+  max-width: 100%;
+  padding: 8px 10px;
+  color: var(--ui-text);
+  background: var(--ui-surface);
+  border: 1px solid var(--ui-border);
+  border-radius: 6px;
+}
+:where(button) {
+  padding: 8px 12px;
+  color: #17120a;
+  background: var(--ui-accent);
+  border: 1px solid var(--ui-accent);
+  border-radius: 6px;
+  cursor: pointer;
+}
+:where(a) { color: var(--ui-accent); }
+:where(:focus-visible) { outline: 2px solid var(--ui-accent); outline-offset: 2px; }
+`
+
+function safeStyle(css: string) {
+  return css.replace(/<\/style/gi, "<\\/style")
+}
+
+function componentFragment(html: string) {
+  const head = html.match(/<head(?:\s[^>]*)?>([\s\S]*?)<\/head>/i)?.[1] ?? ""
+  const body = html.match(/<body(?:\s[^>]*)?>([\s\S]*?)<\/body>/i)?.[1]
+  if (body !== undefined) return `${head}${body}`
+  return html
+    .replace(/<!doctype[^>]*>/gi, "")
+    .replace(/<\/?html(?:\s[^>]*)?>/gi, "")
+    .replace(/<\/?(?:head|body)(?:\s[^>]*)?>/gi, "")
+}
+
+function sessionDocument(
+  widgets: Widget[],
+  layoutCSS: string,
+  sharedCSS: string,
+  allowedAssetOrigins: string[],
+) {
   const csp = widgetCsp(allowedAssetOrigins).replaceAll("&", "&amp;").replaceAll('"', "&quot;")
-  const prelude = `<meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer">${BRIDGE_HTML}`
-  if (/<head(?:\s[^>]*)?>/i.test(html)) {
-    return html.replace(/<head(?:\s[^>]*)?>/i, (head) => `${head}${prelude}`)
-  }
-  if (/<html(?:\s[^>]*)?>/i.test(html)) {
-    return html.replace(/<html(?:\s[^>]*)?>/i, (root) => `${root}<head>${prelude}</head>`)
-  }
-  return `<!doctype html><html><head><meta charset="utf-8">${prelude}</head><body>${html}</body></html>`
+  const sections = widgets
+    .toSorted((a, b) => a.createdAt - b.createdAt)
+    .map((widget) => `<section data-widget-id="${widget.id}">${componentFragment(widget.html)}</section>`)
+    .join("\n")
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer">${BRIDGE_HTML}<style id="oc-default-styles">${safeStyle(DEFAULT_SHARED_CSS)}</style><style id="oc-shared-styles">${safeStyle(sharedCSS)}</style><style id="oc-layout-styles">${safeStyle(layoutCSS)}</style></head><body><main id="oc-root">${sections}</main></body></html>`
 }
 
 function shellHtml(nonce: string) {
@@ -337,7 +464,9 @@ function shellHtml(nonce: string) {
   var currentSession = match ? decodeURIComponent(match[1]) : null;
   var widgets = {};
   var sessions = [];
-  var cards = {};
+  var currentView = { container: null, iframe: null, frameURL: null, restoreState: null, pageScroll: null };
+  var stateRequests = {};
+  var stateRequestID = 0;
   var ws;
   var reconnectTimer;
   var toastTimer;
@@ -432,33 +561,52 @@ function shellHtml(nonce: string) {
     main.appendChild(empty);
   }
 
-  function activate(widget, view) {
-    var old = view.querySelector(".dormant, iframe");
-    if (old) old.remove();
-    var entry = cards[widget.key];
+  function mountFrame(reference, state, pageScroll) {
+    main.replaceChildren();
+    var view = document.createElement("section");
+    view.className = "agent-view";
+    view.setAttribute("aria-label", sessionTitle(reference.sessionID));
     var iframe = document.createElement("iframe");
     iframe.setAttribute("sandbox", "allow-scripts allow-forms");
     iframe.setAttribute("referrerpolicy", "no-referrer");
-    iframe.setAttribute("title", widget.title);
-    iframe.src = widget.frameURL;
+    iframe.setAttribute("title", sessionTitle(reference.sessionID));
+    iframe.src = reference.frameURL;
     view.appendChild(iframe);
-    entry.iframe = iframe;
+    main.appendChild(view);
+    currentView = { container: view, iframe: iframe, frameURL: reference.frameURL, restoreState: state, pageScroll: pageScroll || null };
   }
 
-  function upsertView(widget) {
-    if (widget.sessionID !== currentSession) return;
-    var entry = cards[widget.key];
-    if (!entry) {
-      var view = document.createElement("section");
-      view.className = "agent-view";
-      view.setAttribute("aria-label", widget.title);
-      main.appendChild(view);
-      entry = cards[widget.key] = { view: view, iframe: null };
+  function captureViewState(callback) {
+    if (!currentView.iframe || !currentView.iframe.contentWindow) { callback(null); return; }
+    var id = String(++stateRequestID);
+    var settled = false;
+    stateRequests[id] = function (state) {
+      if (settled) return;
+      settled = true;
+      delete stateRequests[id];
+      callback(state);
+    };
+    currentView.iframe.contentWindow.postMessage({ __ocwParent: 1, kind: "capture-state", requestID: id }, "*");
+    setTimeout(function () { if (stateRequests[id]) stateRequests[id](null); }, 250);
+  }
+
+  function renderSession(preserveState) {
+    renderDrawer();
+    var relevant = Object.keys(widgets).map(function (key) { return widgets[key]; }).filter(function (widget) { return widget.sessionID === currentSession; });
+    relevant.sort(function (a, b) { return a.createdAt - b.createdAt; });
+    if (!relevant.length) {
+      main.replaceChildren();
+      currentView = { container: null, iframe: null, frameURL: null, restoreState: null, pageScroll: null };
+      var empty = document.createElement("div");
+      empty.className = "empty";
+      empty.textContent = "Waiting for agent-generated content in this session.";
+      main.appendChild(empty);
+      return;
     }
-    entry.view.setAttribute("aria-label", widget.title);
-    if (widget.restored) {
-      var old = entry.view.querySelector(".dormant, iframe");
-      if (old) old.remove();
+    var reference = relevant[0];
+    if (currentView.iframe && currentView.frameURL === reference.frameURL) return;
+    if (relevant.every(function (widget) { return widget.restored; }) && !currentView.iframe) {
+      main.replaceChildren();
       var dormant = document.createElement("div");
       dormant.className = "dormant";
       var content = document.createElement("div");
@@ -466,34 +614,20 @@ function shellHtml(nonce: string) {
       text.textContent = "This content was restored from disk. Its saved JavaScript will run only after you activate it.";
       var button = document.createElement("button");
       button.textContent = "Activate saved content";
-      button.addEventListener("click", function () { activate(widget, entry.view); });
+      button.addEventListener("click", function () { mountFrame(reference, null, null); });
       content.append(text, button);
       dormant.appendChild(content);
-      entry.view.appendChild(dormant);
-      entry.iframe = null;
-    } else {
-      activate(widget, entry.view);
-    }
-  }
-
-  function renderSession() {
-    main.replaceChildren();
-    cards = {};
-    renderDrawer();
-    var relevant = Object.keys(widgets).map(function (key) { return widgets[key]; }).filter(function (widget) { return widget.sessionID === currentSession; });
-    relevant.sort(function (a, b) { return a.createdAt - b.createdAt; });
-    if (!relevant.length) {
-      var empty = document.createElement("div");
-      empty.className = "empty";
-      empty.textContent = "Waiting for agent-generated content in this session.";
-      main.appendChild(empty);
+      main.appendChild(dormant);
       return;
     }
-    relevant.forEach(upsertView);
+    if (preserveState && currentView.iframe) {
+      var pageScroll = { x: scrollX, y: scrollY };
+      captureViewState(function (state) { mountFrame(reference, state, pageScroll); });
+    } else mountFrame(reference, null, null);
   }
 
   function render() {
-    if (currentSession) renderSession();
+    if (currentSession) renderSession(false);
     else renderIndex();
   }
 
@@ -509,25 +643,34 @@ function shellHtml(nonce: string) {
   addEventListener("message", function (event) {
     var data = event.data;
     if (!data || data.__ocw !== 1) return;
-    var key = null;
-    Object.keys(cards).some(function (candidate) {
-      if (cards[candidate].iframe && cards[candidate].iframe.contentWindow === event.source) { key = candidate; return true; }
-      return false;
-    });
-    if (!key) return;
+    if (!currentView.iframe || currentView.iframe.contentWindow !== event.source) return;
     if (data.kind === "resize") {
-      cards[key].iframe.style.height = Math.min(Math.max(Number(data.px) || 240, 120), 1600) + "px";
+      currentView.iframe.style.height = Math.min(Math.max(Number(data.px) || 240, 120), 5000) + "px";
+    } else if (data.kind === "ready") {
+      if (currentView.restoreState) {
+        currentView.iframe.contentWindow.postMessage({ __ocwParent: 1, kind: "restore-state", state: currentView.restoreState }, "*");
+        currentView.restoreState = null;
+      }
+      if (currentView.pageScroll) {
+        var savedScroll = currentView.pageScroll;
+        currentView.pageScroll = null;
+        requestAnimationFrame(function () { scrollTo(Number(savedScroll.x) || 0, Number(savedScroll.y) || 0); });
+      }
+    } else if (data.kind === "state") {
+      if (stateRequests[data.requestID]) stateRequests[data.requestID](data.state);
     } else if (data.kind === "error") {
       notify(String(data.message || "Widget interaction was blocked."), true);
     } else if (data.kind === "prompt") {
       var text = String(data.text || "");
       if (text.length > 64000) notify("Widget prompt is too large.", true);
-      else safeSend({ type: "submit", key: key, text: text });
+      else if (!data.id) notify("The interaction has no owning generated section.", true);
+      else safeSend({ type: "submit", id: String(data.id), text: text });
     } else if (data.kind === "data") {
       try {
         var encoded = JSON.stringify(data.data);
         if (encoded.length > 64000) throw new Error("too large");
-        safeSend({ type: "data", key: key, data: data.data });
+        if (!data.id) throw new Error("missing generated section id");
+        safeSend({ type: "data", id: String(data.id), data: data.data });
       } catch (_) {
         notify("Widget data must be JSON-serializable and smaller than 64 KB.", true);
       }
@@ -554,13 +697,11 @@ function shellHtml(nonce: string) {
         message.widgets.forEach(function (widget) { widgets[widget.key] = widget; });
         sessions = message.sessions;
         render();
-      } else if (message.type === "widget") {
-        widgets[message.widget.key] = message.widget;
-        if (message.widget.sessionID === currentSession) renderSession();
+      } else if (message.type === "session-widgets") {
+        Object.keys(widgets).forEach(function (key) { if (widgets[key].sessionID === message.sessionID) delete widgets[key]; });
+        message.widgets.forEach(function (widget) { widgets[widget.key] = widget; });
+        if (message.sessionID === currentSession) renderSession(true);
         else renderDrawer();
-      } else if (message.type === "remove") {
-        delete widgets[message.key];
-        render();
       } else if (message.type === "session") {
         var replaced = false;
         sessions = sessions.map(function (session) {
@@ -594,6 +735,8 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
   const authToken = randomToken()
   const shellNonce = randomToken(18)
   const widgets = new Map<string, Widget>()
+  const layouts = new Map<string, SessionLayout>()
+  const sessionFrameTokens = new Map<string, string>()
   const sessionTitles = new Map<string, string>()
   const sockets = new Set<PanelSocket>()
   const pendingData = new Map<string, DataEvent[]>()
@@ -609,6 +752,7 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
   let serveError: string | null = null
   let openedBrowser = false
   let disposed = false
+  let sharedStyles = ""
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
     client.app.log({ body: { service: "opencode-generative-ui", level, message, extra } }).catch(() => {})
@@ -616,6 +760,29 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
   const sessionsForClient = (): SessionSummary[] => {
     const ids = new Set([...widgets.values()].map((widget) => widget.sessionID))
     return [...ids].map((id) => ({ id, title: sessionTitles.get(id) ?? id }))
+  }
+
+  const widgetsForSession = (sessionID: string) =>
+    [...widgets.values()].filter((widget) => widget.sessionID === sessionID)
+
+  const sessionFrameKey = (sessionID: string) =>
+    createHash("sha256").update("session-frame\0").update(sessionID).digest("base64url").slice(0, 24)
+
+  const sessionFrameToken = (sessionID: string) => {
+    const existing = sessionFrameTokens.get(sessionID)
+    if (existing) return existing
+    const token = randomToken()
+    sessionFrameTokens.set(sessionID, token)
+    return token
+  }
+
+  const sessionVersion = (sessionID: string) => {
+    const layout = layouts.get(sessionID)
+    const hash = createHash("sha256").update(layout?.css ?? "").update(":").update(String(layout?.updatedAt ?? 0))
+    for (const widget of widgetsForSession(sessionID).toSorted((a, b) => a.key.localeCompare(b.key))) {
+      hash.update("\0").update(widget.key).update(":").update(String(widget.updatedAt))
+    }
+    return hash.digest("base64url").slice(0, 16)
   }
 
   const widgetForClient = (widget: Widget): ClientWidget => ({
@@ -628,7 +795,7 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
     createdAt: widget.createdAt,
     updatedAt: widget.updatedAt,
     restored: widget.restored,
-    frameURL: `${panelOrigin}/frame/${encodeURIComponent(widget.key)}?token=${encodeURIComponent(widget.frameToken)}&v=${widget.updatedAt}`,
+    frameURL: `${panelOrigin}/frame/${sessionFrameKey(widget.sessionID)}?token=${encodeURIComponent(sessionFrameToken(widget.sessionID))}&v=${sessionVersion(widget.sessionID)}`,
   })
 
   const send = (socket: PanelSocket, message: ServerMessage) => {
@@ -645,14 +812,20 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
     for (const socket of sockets) send(socket, message)
   }
 
+  const broadcastSessionWidgets = (sessionID: string) => {
+    const current = widgetsForSession(sessionID)
+    broadcast({ type: "session-widgets", sessionID, widgets: current.map(widgetForClient) })
+  }
+
   const broadcastSubmissionStatus = (submission: Submission, status: "queued" | "sent" | "failed", message: string) => {
     broadcast({ type: "submission-status", id: submission.id, status, message })
   }
 
   const persist = async () => {
     const state: PersistedState = {
-      version: 1,
-      widgets: [...widgets.values()].map(({ restored: _restored, frameToken: _frameToken, ...widget }) => widget),
+      version: 2,
+      widgets: [...widgets.values()].map(({ restored: _restored, ...widget }) => widget),
+      layouts: Object.fromEntries(layouts),
     }
     await mkdir(config.stateDirectory, { recursive: true, mode: 0o700 })
     const temporary = `${stateFile}.${process.pid}.${randomToken(6)}.tmp`
@@ -665,8 +838,12 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
     try {
       const info = await stat(stateFile)
       if (info.size > MAX_PERSISTED_STATE_BYTES) throw new Error("persisted state exceeds the size limit")
-      const parsed = JSON.parse(await readFile(stateFile, "utf8")) as Partial<PersistedState>
-      if (parsed.version !== 1 || !Array.isArray(parsed.widgets)) throw new Error("unsupported persisted state")
+      const parsed = JSON.parse(await readFile(stateFile, "utf8")) as {
+        version?: number
+        widgets?: Array<Partial<Omit<Widget, "restored">>>
+        layouts?: Record<string, Partial<SessionLayout>>
+      }
+      if ((parsed.version !== 1 && parsed.version !== 2) || !Array.isArray(parsed.widgets)) throw new Error("unsupported persisted state")
       for (const item of parsed.widgets) {
         if (
           !item ||
@@ -679,10 +856,13 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
         ) continue
         const key = widgetKey(item.sessionID, item.id)
         const widget: Widget = {
-          ...item,
           key,
-          frameToken: randomToken(),
+          id: item.id,
+          sessionID: item.sessionID,
           sessionTitle: typeof item.sessionTitle === "string" ? item.sessionTitle : item.sessionID,
+          agent: item.agent,
+          title: item.title,
+          html: item.html,
           createdAt: Number(item.createdAt) || Date.now(),
           updatedAt: Number(item.updatedAt) || Date.now(),
           restored: true,
@@ -690,20 +870,41 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
         widgets.set(key, widget)
         sessionTitles.set(widget.sessionID, widget.sessionTitle)
       }
+      if (parsed.version === 2 && parsed.layouts && typeof parsed.layouts === "object") {
+        for (const [sessionID, layout] of Object.entries(parsed.layouts)) {
+          if (!layout || typeof layout.css !== "string" || Buffer.byteLength(layout.css, "utf8") > MAX_STYLESHEET_BYTES) continue
+          layouts.set(sessionID, { css: layout.css, updatedAt: Number(layout.updatedAt) || Date.now() })
+        }
+      }
     } catch (error) {
       const code = error && typeof error === "object" && "code" in error ? error.code : null
       if (code !== "ENOENT") log("warn", "failed to load persisted widget state", { error: String(error) })
     }
   }
 
+  const loadSharedStyles = async () => {
+    if (!config.stylesheetPath) return
+    const configured = config.stylesheetPath.startsWith("~/")
+      ? path.join(homedir(), config.stylesheetPath.slice(2))
+      : config.stylesheetPath
+    const file = path.isAbsolute(configured) ? configured : path.resolve(worktree, configured)
+    try {
+      const info = await stat(file)
+      if (info.size > MAX_STYLESHEET_BYTES) throw new Error(`stylesheet exceeds ${MAX_STYLESHEET_BYTES} bytes`)
+      sharedStyles = await readFile(file, "utf8")
+      log("info", "loaded shared widget stylesheet", { file })
+    } catch (error) {
+      log("warn", "failed to load shared widget stylesheet", { file, error: String(error) })
+    }
+  }
+
+  await loadSharedStyles()
   await loadPersistedState()
 
   const sessionURL = (sessionID: string) => {
     if (!panelOrigin) return null
     return `${panelOrigin}${sessionPath(sessionID)}?token=${encodeURIComponent(authToken)}`
   }
-
-  const rootURL = () => panelOrigin ? `${panelOrigin}/?token=${encodeURIComponent(authToken)}` : null
 
   const openBrowser = (url: string) => {
     if (openedBrowser || !config.autoOpen) return
@@ -799,6 +1000,8 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
     sessionStatus.delete(sessionID)
     authorizedSessions.delete(sessionID)
     sessionTitles.delete(sessionID)
+    layouts.delete(sessionID)
+    sessionFrameTokens.delete(sessionID)
     await persist()
     broadcast({ type: "session-remove", sessionID })
   }
@@ -814,24 +1017,26 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
     }
     if (!message || typeof message !== "object" || typeof message.type !== "string") return
     if (message.type === "data") {
-      if (typeof message.key !== "string" || !widgets.has(message.key)) return
+      if (!socket.data.sessionID || typeof message.id !== "string") return
+      const key = widgetKey(socket.data.sessionID, message.id)
+      if (!widgets.has(key)) return
       try {
         if (jsonBytes(message.data) > MAX_DATA_BYTES) throw new Error("payload too large")
       } catch {
         send(socket, { type: "notice", level: "error", message: "Widget data was rejected because it is not valid JSON or exceeds 64 KB." })
         return
       }
-      const events = pendingData.get(message.key) ?? []
+      const events = pendingData.get(key) ?? []
       events.push({ data: message.data, at: Date.now() })
       if (events.length > MAX_DATA_EVENTS_PER_WIDGET) events.shift()
-      pendingData.set(message.key, events)
+      pendingData.set(key, events)
       return
     }
 
     if (message.type === "submit") {
-      if (typeof message.key !== "string" || typeof message.text !== "string" || Buffer.byteLength(message.text, "utf8") > MAX_DATA_BYTES) return
-      const widget = widgets.get(message.key)
-      if (!widget || (socket.data.sessionID && socket.data.sessionID !== widget.sessionID)) return
+      if (!socket.data.sessionID || typeof message.id !== "string" || typeof message.text !== "string" || Buffer.byteLength(message.text, "utf8") > MAX_DATA_BYTES) return
+      const widget = widgets.get(widgetKey(socket.data.sessionID, message.id))
+      if (!widget) return
       const queuedCount = [...submissionQueues.values()].reduce((total, queue) => total + queue.length, 0)
       if (queuedCount >= MAX_PENDING_SUBMISSIONS) {
         send(socket, { type: "notice", level: "error", message: "Too many interactions are waiting for an agent session." })
@@ -882,13 +1087,14 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
         }
         const frameMatch = url.pathname.match(/^\/frame\/([^/]+)$/)
         if (req.method === "GET" && frameMatch) {
-          let key: string
-          try { key = decodeURIComponent(frameMatch[1]) } catch { return new Response("bad widget key", { status: 400 }) }
-          const widget = widgets.get(key)
-          if (!widget || url.searchParams.get("token") !== widget.frameToken) {
+          let frameKey: string
+          try { frameKey = decodeURIComponent(frameMatch[1]) } catch { return new Response("bad session frame", { status: 400 }) }
+          const sessionID = sessionsForClient().map((session) => session.id).find((id) => sessionFrameKey(id) === frameKey)
+          if (!sessionID || url.searchParams.get("token") !== sessionFrameToken(sessionID)) {
             return new Response("forbidden", { status: 403 })
           }
-          return new Response(widgetDocument(widget.html, config.allowedAssetOrigins), {
+          const current = widgetsForSession(sessionID)
+          return new Response(sessionDocument(current, layouts.get(sessionID)?.css ?? "", sharedStyles, config.allowedAssetOrigins), {
             headers: {
               "content-type": "text/html; charset=utf-8",
               "cache-control": "no-store",
@@ -982,6 +1188,10 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
     }
   }
 
+  const activateSessionContent = (sessionID: string) => {
+    for (const widget of widgetsForSession(sessionID)) widget.restored = false
+  }
+
   return {
     dispose: async () => {
       disposed = true
@@ -1020,23 +1230,23 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
     tool: {
       widget_render: tool({
         description: [
-          "Render or replace a self-contained HTML/CSS/JavaScript view in the user's companion browser panel.",
-          "The generated view is frameless, full width, and fills the region below the panel header when it is the only view. Design it as a complete interface and control its layout, spacing, and background.",
-          "Use the same id to update a view in place. IDs are scoped to the current session.",
-          "The iframe is sandboxed and external networking is blocked except for configured static asset hosts.",
+          "Render or replace one HTML/CSS/JavaScript section in the current session's composed browser interface.",
+          "All retained IDs share one sandboxed document, shared stylesheet, and layout. Coordinate new sections with existing ones instead of designing unrelated standalone cards.",
+          "Use widget_layout to control #oc-root and place sections with [data-widget-id=\"<id>\"]. Use the same id to update a section in place.",
+          "External networking is blocked except for configured static asset hosts.",
           "Available bridge functions:",
-          "- sendPrompt(text): send an interaction that resumes this session as soon as it is idle. Call it directly from a click or submit handler.",
-          "- sendData(value): queue JSON data silently. It is attached to the next sendPrompt interaction.",
-          "- setHeight(px): set the iframe height; automatic resizing is enabled by default.",
+          "- sendPrompt(text, id?): send an interaction that resumes this session as soon as it is idle. The owning section id is inferred from the clicked control; pass id for asynchronous handlers.",
+          "- sendData(value, id?): queue JSON data silently for the owning section. It is attached to the next sendPrompt interaction.",
+          "- setHeight(px): set the composed document height; automatic resizing is enabled by default.",
           "Forms must prevent their default submission and use sendPrompt(). Inline all other CSS and JavaScript.",
           config.allowedAssetOrigins.length
             ? `Allowed static asset origins: ${config.allowedAssetOrigins.join(", ")}.`
             : "No external asset origins are currently allowed.",
         ].join("\n"),
         args: {
-          id: ID_SCHEMA.describe("Stable session-local view id, such as 'test-results'."),
-          title: tool.schema.string().min(1).max(120).describe("Accessible iframe title used by browser assistive technology and tool listings; the panel does not render title chrome."),
-          html: tool.schema.string().max(MAX_WIDGET_HTML_BYTES).describe("Self-contained HTML fragment or document with inline CSS and JavaScript."),
+          id: ID_SCHEMA.describe("Stable session-local section id, such as 'test-results'."),
+          title: tool.schema.string().min(1).max(120).describe("Short section title used in tool listings; the panel does not render title chrome."),
+          html: tool.schema.string().max(MAX_WIDGET_HTML_BYTES).describe("HTML fragment with optional inline CSS and JavaScript. Full documents are normalized into a section."),
         },
         async execute(args, ctx) {
           if (serveError || !panelOrigin) {
@@ -1066,7 +1276,6 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
           const title = await resolveSessionTitle(ctx.sessionID)
           const widget: Widget = {
             key,
-            frameToken: randomToken(),
             id: args.id,
             sessionID: ctx.sessionID,
             sessionTitle: title,
@@ -1078,9 +1287,10 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
             restored: false,
           }
           widgets.set(key, widget)
+          activateSessionContent(ctx.sessionID)
           sessionTitles.set(ctx.sessionID, title)
           await persist()
-          broadcast({ type: "widget", widget: widgetForClient(widget) })
+          broadcastSessionWidgets(ctx.sessionID)
           const url = sessionURL(ctx.sessionID)!
           openBrowser(url)
           ctx.metadata({ title: `widget: ${widget.title}`, metadata: { widgetID: widget.id, url } })
@@ -1099,9 +1309,46 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
           const key = widgetKey(ctx.sessionID, args.id)
           if (!widgets.delete(key)) return `No widget with id '${args.id}' exists in this session.`
           pendingData.delete(key)
+          activateSessionContent(ctx.sessionID)
           await persist()
-          broadcast({ type: "remove", key })
+          broadcastSessionWidgets(ctx.sessionID)
           return `Removed widget '${args.id}' from this session.`
+        },
+      }),
+
+      widget_layout: tool({
+        description: [
+          "Set the CSS that composes all retained sections in the current session.",
+          "Target #oc-root for the overall layout and [data-widget-id=\"<id>\"] for individual placement.",
+          "The CSS is appended after the built-in and configured shared styles, so it can override them.",
+          "Prefer responsive grid or flex layouts and update this CSS whenever adding or removing sections changes the composition.",
+        ].join("\n"),
+        args: {
+          css: tool.schema.string().max(MAX_STYLESHEET_BYTES).describe("Session composition CSS. Use an empty string to return to the shared default layout."),
+        },
+        async execute(args, ctx) {
+          if (Buffer.byteLength(args.css, "utf8") > MAX_STYLESHEET_BYTES) {
+            return { title: "Layout is too large", output: `Layout CSS must be at most ${MAX_STYLESHEET_BYTES} UTF-8 bytes.` }
+          }
+          const retainedLayoutBytes = [...layouts.entries()].reduce(
+            (total, [sessionID, layout]) => total + (sessionID === ctx.sessionID ? 0 : Buffer.byteLength(layout.css, "utf8")),
+            Buffer.byteLength(args.css, "utf8"),
+          )
+          if (retainedLayoutBytes > MAX_TOTAL_LAYOUT_BYTES) {
+            return { title: "Layout storage limit reached", output: `Retained layout CSS must total at most ${MAX_TOTAL_LAYOUT_BYTES} UTF-8 bytes.` }
+          }
+          await authorizeRender(ctx, "layout")
+          layouts.set(ctx.sessionID, { css: args.css, updatedAt: Date.now() })
+          activateSessionContent(ctx.sessionID)
+          await persist()
+          broadcastSessionWidgets(ctx.sessionID)
+          const url = sessionURL(ctx.sessionID)
+          ctx.metadata({ title: "updated generated UI layout", metadata: { url } })
+          return {
+            title: "Updated generated UI layout",
+            output: `Updated the shared layout for this session.${url ? ` Panel: ${url}` : ""}`,
+            metadata: { sessionID: ctx.sessionID, url },
+          }
         },
       }),
 
@@ -1113,7 +1360,7 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, project, worktree },
           const url = sessionURL(ctx.sessionID)
           if (!current.length) return `No widgets are rendered for this session.${url ? ` Panel: ${url}` : ""}`
           const lines = current.map((widget) => `- ${widget.id}: "${widget.title}" (updated ${new Date(widget.updatedAt).toISOString()}${widget.restored ? ", restored" : ""})`)
-          return `Panel: ${url}\n${lines.join("\n")}`
+          return `Panel: ${url}\nLayout CSS: ${layouts.get(ctx.sessionID)?.css ? "custom" : "shared default"}\n${lines.join("\n")}`
         },
       }),
     },
