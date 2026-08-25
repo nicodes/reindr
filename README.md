@@ -1,39 +1,46 @@
 # reindr
 
-A prototype OpenCode plugin that gives each agent session an editable HTML file and displays it in a companion Chromium panel. The file is the interface: the agent uses normal filesystem tools to write HTML, CSS, and JavaScript, while the plugin handles discovery, live reload, sandboxing, session routing, and browser-to-agent interactions.
+A generative interface runtime that gives an agent session an editable HTML file and displays it in a companion browser panel. The file is the interface: the agent uses normal filesystem tools to write HTML, CSS, and JavaScript, while Reindr handles discovery, live reload, sandboxing, session routing, and browser-to-agent interactions.
 
-The runtime implementation is one file:
+The monorepo currently contains:
 
 ```text
-.opencode/plugins/reindr.ts
+packages/core/       @nicodes/reindr-core
+packages/opencode/   @nicodes/reindr-opencode
+packages/claude/     self-contained Claude Code marketplace plugin
 ```
 
 ## Prototype Status
 
-The source plugin works as a project-local OpenCode plugin. The `reindr` npm name and package metadata are prepared for development, but this repository is not yet a published npm plugin.
+The OpenCode npm packages and Claude Code marketplace plugin are complete and prepared for their first `0.0.1` release. They are not published yet.
 
 The prototype targets OpenCode `1.18.22` and Chromium desktop.
 
-## Install Locally
+## Install For OpenCode
 
-This repository already uses the canonical project plugin location. Quit and restart OpenCode from this project to load it.
+Add the adapter to `~/.config/opencode/opencode.json` for every project, or to a project-root `opencode.json` for one project:
 
-To try it in another project, copy the plugin file:
-
-```text
-your-project/
-  .opencode/
-    plugins/
-      reindr.ts
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["@nicodes/reindr-opencode"]
+}
 ```
 
-For a global source installation, copy it to:
+OpenCode installs the package and its `@nicodes/reindr-core` dependency automatically with Bun at startup. Quit and restart OpenCode after changing the plugin list. Do not also install a local source copy, because OpenCode loads local and npm plugins separately.
+
+For repository development, the tracked `.opencode/plugins/reindr.ts` shim loads `packages/opencode/src/index.ts` directly after `bun install` and `bun run build:core`.
+
+## Install For Claude Code
+
+Add the repository marketplace and install its Reindr plugin:
 
 ```text
-~/.config/opencode/plugins/reindr.ts
+/plugin marketplace add nicodes/reindr
+/plugin install reindr@nicodes
 ```
 
-OpenCode loads plugin files only at startup, so restart it after installing or changing the plugin.
+Restart Claude Code, then ask it to build an interface or invoke `/reindr:interface`. The plugin includes a self-contained MCP runtime, session hook, interaction monitor, and research-preview channel declaration. See [`packages/claude/README.md`](packages/claude/README.md) for channel testing details.
 
 ## Use
 
@@ -131,7 +138,7 @@ $XDG_DATA_HOME/reindr/templates/reindr-loading.html
 $XDG_DATA_HOME/reindr/templates/opencode-controller.html
 ```
 
-The tracked source assets are [`templates/reindr-loading.html`](templates/reindr-loading.html) and [`templates/opencode-controller.html`](templates/opencode-controller.html). On startup, Reindr copies them into the user data directory when no saved template exists. When `XDG_DATA_HOME` is unset, these resolve under `~/.local/share/reindr/templates`. Reindr never overwrites customized templates and reads the selected saved copy each time `reindr_open` creates a session UI.
+The tracked source assets are [`packages/opencode/assets/reindr-loading.html`](packages/opencode/assets/reindr-loading.html) and [`packages/opencode/assets/opencode-controller.html`](packages/opencode/assets/opencode-controller.html). They ship in the npm package. On startup, Reindr copies them into the user data directory when no saved template exists. When `XDG_DATA_HOME` is unset, these resolve under `~/.local/share/reindr/templates`. Reindr never overwrites customized templates and reads the selected saved copy each time `reindr_open` creates a session UI.
 
 Use `{{sessionTitle}}` where the escaped OpenCode session title should appear. Additional `.html` files saved in the templates directory appear as clickable items under the authenticated landing page's **Templates** tab. Clicking one opens a sandboxed, read-only preview; controller mutations are disabled until the unmodified built-in controller is used by a real session.
 
@@ -141,7 +148,7 @@ OpenCode 1.18.22 does not expose a public v1 API for persistent session agent/mo
 
 ## Tailwind And Shared Styling
 
-The shipped templates use Tailwind CSS 4 utilities without a browser runtime or CDN dependency. `npm run build:tailwind` scans `templates/*.html` plus dynamic utility strings in `.opencode/plugins/reindr.ts` and writes the minified, content-scoped stylesheet to `.opencode/reindr-tailwind.css`. Reindr embeds that generated stylesheet in each sandboxed frame.
+The shipped templates use Tailwind CSS 4 utilities without a browser runtime or CDN dependency. `npm run build:opencode` scans the adapter source and `packages/opencode/assets/*.html`, then writes the minified, content-scoped stylesheet to `packages/opencode/assets/reindr-tailwind.css`. Reindr embeds that generated stylesheet in each sandboxed frame.
 
 The generated document also receives a small neutral base stylesheet before Tailwind. It supplies dark defaults and reusable tokens such as `--ui-bg`, `--ui-surface`, `--ui-text`, and `--ui-accent` for session HTML that does not use utilities.
 
@@ -166,14 +173,14 @@ Secure defaults require no configuration.
 | `REINDR_ALLOWED_ASSET_HOSTS` | empty | Comma-separated HTTPS hosts allowed to serve static assets. |
 | `REINDR_STYLESHEET` | empty | Local CSS file inserted before each session file's styles. Relative paths resolve from the project worktree. |
 
-The eventual npm package also accepts plugin options:
+The npm package also accepts plugin options:
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "reindr",
+      "@nicodes/reindr-opencode",
       {
         "port": 4917,
         "autoOpen": true,
@@ -239,9 +246,18 @@ Run static checks and tests:
 ```sh
 bun run typecheck
 bun run test
+bun run pack:check
 ```
 
-The core suite runs the real plugin through an HTTP/WebSocket Bun adapter and verifies discovery across separate plugin ports. The browser suite launches `/usr/bin/chromium` and verifies file-backed live reload, cross-port session navigation, configurable styles, state preservation, CSP enforcement, private bridge delivery, and click-to-activate restoration.
+The core suite runs the real OpenCode plugin through an HTTP/WebSocket Bun adapter and verifies discovery across separate plugin ports. The browser suites launch `/usr/bin/chromium` and verify file-backed live reload, cross-port session navigation, configurable styles, state preservation, CSP enforcement, private bridge delivery, Claude MCP startup, sandboxing, synthetic-interaction rejection, and trusted interaction delivery.
+
+## Publish
+
+The **Publish packages** GitHub Actions workflow is manually triggerable from the `main` branch. Choose `all`, `core`, or `opencode`; dry-run mode is enabled by default. A real publish reruns every release check, refuses an existing version, publishes core before the OpenCode adapter when `all` is selected, and records npm provenance.
+
+Add an `NPM_TOKEN` Actions secret before the first real run. It must be an npm granular access token allowed to publish both `@nicodes` packages and configured to bypass 2FA for automation. The committed package manifests remain the source of truth for versions; the workflow never edits versions or tags.
+
+The Claude plugin is not an npm release target. Its versioned marketplace files become available when they are merged to the repository's default branch.
 
 ## Prototype Limitations
 
@@ -250,4 +266,4 @@ The core suite runs the real plugin through an HTTP/WebSocket Bun adapter and ve
 - Full-file updates preserve basic form/focus/scroll state, not JavaScript heap state or event state.
 - Full-document normalization preserves head/body contents and escaped `class` attributes for Tailwind; other original `html` and `body` attributes are discarded.
 - CDN assets require explicit trusted-host configuration.
-- The npm package has not been prepared or published yet; source-file installation is the supported prototype path.
+- The packages are prepared but remain unpublished until the initial `0.0.1` release is completed.

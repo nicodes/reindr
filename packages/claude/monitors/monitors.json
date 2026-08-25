@@ -1,0 +1,7 @@
+[
+  {
+    "name": "reindr-interactions",
+    "command": "node \"${CLAUDE_PLUGIN_ROOT}/scripts/monitor.mjs\" \"${CLAUDE_PLUGIN_DATA}\"",
+    "description": "Interactions submitted from Reindr interfaces"
+  }
+]

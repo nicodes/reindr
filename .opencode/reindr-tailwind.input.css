@@ -1,3 +1,0 @@
-@import "tailwindcss" source(none);
-@source "./plugins/reindr.ts";
-@source "../templates/**/*.html";
