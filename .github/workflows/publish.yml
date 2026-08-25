@@ -1,0 +1,143 @@
+name: Publish packages
+run-name: Publish ${{ inputs.target }} (dry run ${{ inputs.dry_run }})
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Package release target
+        required: true
+        type: choice
+        options:
+          - all
+          - core
+          - opencode
+      dry_run:
+        description: Validate without publishing to npm
+        required: true
+        default: true
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write # npm provenance
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Releases come from main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_REF" != "refs/heads/main" ]; then
+            echo "::error::run package publishing from the main branch, not $GITHUB_REF"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@53b83947a5a98c8d113130e565377fae1a50d02f # v6.3.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: 1.4.0
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Install Chromium
+        shell: bash
+        run: |
+          set -euo pipefail
+          node node_modules/playwright-core/cli.js install --with-deps chromium
+          executable_path="$(node --input-type=module -e "import { chromium } from 'playwright-core'; process.stdout.write(chromium.executablePath())")"
+          echo "CHROMIUM_EXECUTABLE_PATH=$executable_path" >> "$GITHUB_ENV"
+
+      - name: Validate release metadata
+        env:
+          TARGET: ${{ inputs.target }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFile } from "node:fs/promises"
+
+          const target = process.env.TARGET
+          const core = JSON.parse(await readFile("packages/core/package.json", "utf8"))
+          const opencode = JSON.parse(await readFile("packages/opencode/package.json", "utf8"))
+          if (!["all", "core", "opencode"].includes(target)) throw new Error(`Unsupported target: ${target}`)
+          if (opencode.dependencies[core.name] !== `^${core.version}`) {
+            throw new Error(`${opencode.name} must depend on ${core.name} at ^${core.version}`)
+          }
+          NODE
+
+      - name: Check and test
+        run: npm run check
+
+      - name: Validate Claude marketplace
+        run: |
+          npx --yes @anthropic-ai/claude-code@2.1.239 plugin validate packages/claude --strict
+          npx --yes @anthropic-ai/claude-code@2.1.239 plugin validate . --strict
+
+      - name: Verify npm authentication
+        if: ${{ inputs.dry_run == false }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm whoami
+
+      - name: Refuse existing versions
+        if: ${{ inputs.dry_run == false }}
+        env:
+          TARGET: ${{ inputs.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm ping >/dev/null
+
+          check_unpublished() {
+            local manifest="$1"
+            local name version
+            name="$(node -p "require('./${manifest}').name")"
+            version="$(node -p "require('./${manifest}').version")"
+            if npm view "${name}@${version}" version >/dev/null 2>&1; then
+              echo "::error::${name}@${version} is already published"
+              exit 1
+            fi
+          }
+
+          if [ "$TARGET" = all ] || [ "$TARGET" = core ]; then
+            check_unpublished packages/core/package.json
+          fi
+          if [ "$TARGET" = all ] || [ "$TARGET" = opencode ]; then
+            check_unpublished packages/opencode/package.json
+          fi
+
+          if [ "$TARGET" = opencode ]; then
+            core_name="$(node -p "require('./packages/core/package.json').name")"
+            core_version="$(node -p "require('./packages/core/package.json').version")"
+            published_core="$(npm view "${core_name}@${core_version}" version)"
+            if [ "$published_core" != "$core_version" ]; then
+              echo "::error::publish ${core_name}@${core_version} before the OpenCode adapter"
+              exit 1
+            fi
+          fi
+
+      - name: Publish core
+        if: ${{ inputs.dry_run == false && (inputs.target == 'all' || inputs.target == 'core') }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --workspace @nicodes/reindr-core --access public --provenance
+
+      - name: Publish OpenCode adapter
+        if: ${{ inputs.dry_run == false && (inputs.target == 'all' || inputs.target == 'opencode') }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --workspace @nicodes/reindr-opencode --access public --provenance

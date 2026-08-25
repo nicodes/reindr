@@ -1,0 +1,44 @@
+{
+  "name": "@nicodes/reindr-opencode",
+  "version": "0.0.1",
+  "description": "Editable browser interfaces for OpenCode sessions",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist", "assets", "README.md", "LICENSE"],
+  "engines": { "node": ">=22.12.0" },
+  "scripts": {
+    "build:css": "tailwindcss -i assets/reindr-tailwind.input.css -o assets/reindr-tailwind.css --minify",
+    "build": "rm -rf dist && npm run build:css && tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepack": "npm run build"
+  },
+  "dependencies": {
+    "@nicodes/reindr-core": "^0.0.1",
+    "@opencode-ai/plugin": "1.18.22"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "@types/node": "^24.0.0",
+    "tailwindcss": "^4.3.3",
+    "typescript": "^5.9.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nicodes/reindr.git",
+    "directory": "packages/opencode"
+  },
+  "homepage": "https://reindr.dev",
+  "bugs": { "url": "https://github.com/nicodes/reindr/issues" },
+  "keywords": ["reindr", "opencode", "opencode-plugin", "generative-ui"],
+  "author": "Nico Zessoules",
+  "license": "MIT",
+  "publishConfig": { "access": "public" }
+}
