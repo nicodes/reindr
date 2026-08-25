@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "reindr": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/dist/server.mjs"],
+      "env": {
+        "REINDR_PLUGIN_ROOT": "${CLAUDE_PLUGIN_ROOT}",
+        "REINDR_DATA_DIRECTORY": "${CLAUDE_PLUGIN_DATA}",
+        "REINDR_PROJECT_DIRECTORY": "${CLAUDE_PROJECT_DIR}"
+      }
+    }
+  }
+}

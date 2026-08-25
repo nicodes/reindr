@@ -1,24 +1,31 @@
 {
-  "name": "reindr",
-  "version": "0.0.0",
+  "name": "reindr-monorepo",
+  "version": "0.0.1",
   "private": true,
   "type": "module",
   "packageManager": "bun@1.4.0",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "build:tailwind": "tailwindcss -i .opencode/reindr-tailwind.input.css -o .opencode/reindr-tailwind.css --minify",
-    "pretest": "npm run build:tailwind",
-    "typecheck": "tsc --noEmit",
+    "build": "npm run build:core && npm run build:opencode && npm run build:claude",
+    "build:core": "rm -rf packages/core/dist && tsc -p packages/core/tsconfig.build.json",
+    "build:opencode": "rm -rf packages/opencode/dist && tailwindcss -i packages/opencode/assets/reindr-tailwind.input.css -o packages/opencode/assets/reindr-tailwind.css --minify && tsc -p packages/opencode/tsconfig.build.json",
+    "build:claude": "node packages/claude/scripts/build.mjs",
+    "typecheck": "npm run build:core && tsc -p packages/core/tsconfig.json --noEmit && tsc -p packages/opencode/tsconfig.json --noEmit && tsc --noEmit",
+    "pretest": "npm run build",
     "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
     "test:core": "node --import tsx --test test/core.test.ts",
-    "test:browser": "node --import tsx --test test/browser.test.ts"
-  },
-  "dependencies": {
-    "@opencode-ai/plugin": "1.18.22"
+    "test:browser": "node --import tsx --test test/browser.test.ts",
+    "pack:check": "npm pack --workspace @nicodes/reindr-core --dry-run && npm pack --workspace @nicodes/reindr-opencode --dry-run",
+    "check": "npm run typecheck && npm test && npm run pack:check"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.2",
     "playwright-core": "^1.55.0",
     "tailwindcss": "^4.3.3",
     "tsx": "^4.20.0",

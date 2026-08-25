@@ -7,6 +7,8 @@ import { chromium } from "playwright-core"
 import plugin from "../.opencode/plugins/reindr.ts"
 import { fakeClient, freePort, installBunServeAdapter, waitForHTTP } from "./harness.ts"
 
+const chromiumExecutablePath = process.env.CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium"
+
 async function sessionEnvironment(hooks: Awaited<ReturnType<typeof plugin>>, sessionID: string) {
   const output = { env: {} as Record<string, string> }
   await hooks["shell.env"]?.({ cwd: process.cwd(), sessionID, callID: `call-${sessionID}` }, output)
@@ -95,7 +97,7 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   }
   const pluginOptions = { port, autoOpen: false, canvasDirectory, templateDirectory, stylesheetPath }
   let hooks = await plugin(pluginInput, pluginOptions)
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true })
+  const browser = await chromium.launch({ executablePath: chromiumExecutablePath, headless: true })
 
   t.after(async () => {
     await browser.close()
@@ -233,7 +235,7 @@ test("OpenCode controller template drives and visualizes its session", async (t)
     experimental_workspace: { register() {} },
     $: undefined as never,
   }, { port: await freePort(), autoOpen: false, canvasDirectory, templateDirectory })
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true })
+  const browser = await chromium.launch({ executablePath: chromiumExecutablePath, headless: true })
 
   t.after(async () => {
     await browser.close()
@@ -334,7 +336,7 @@ test("Chromium switches between plugin processes in one tab", async (t) => {
   const firstHooks = await plugin(pluginInput(firstFake.client), { port: firstPort, autoOpen: false, canvasDirectory, templateDirectory })
   const secondPort = await freePort()
   const secondHooks = await plugin(pluginInput(secondFake.client), { port: secondPort, autoOpen: false, canvasDirectory, templateDirectory })
-  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true })
+  const browser = await chromium.launch({ executablePath: chromiumExecutablePath, headless: true })
   let secondDisposed = false
 
   t.after(async () => {

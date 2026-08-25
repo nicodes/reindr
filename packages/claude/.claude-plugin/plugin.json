@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin.json",
+  "name": "reindr",
+  "displayName": "Reindr",
+  "version": "0.0.1",
+  "description": "Build and operate secure, live generative interfaces from Claude Code.",
+  "author": {
+    "name": "nicodes",
+    "url": "https://github.com/nicodes"
+  },
+  "homepage": "https://reindr.dev",
+  "repository": "https://github.com/nicodes/reindr",
+  "license": "MIT",
+  "keywords": ["interface", "visualization", "mcp"],
+  "experimental": {
+    "monitors": "./monitors/monitors.json"
+  },
+  "channels": [
+    {
+      "server": "reindr"
+    }
+  ]
+}

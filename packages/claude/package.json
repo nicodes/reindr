@@ -1,0 +1,14 @@
+{
+  "name": "@nicodes/reindr-claude-workspace",
+  "version": "0.0.1",
+  "private": true,
+  "description": "Claude Code plugin for Reindr generative interfaces",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

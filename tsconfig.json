@@ -9,5 +9,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": [".opencode/plugins/**/*.ts", "test/**/*.ts"]
+  "include": [".opencode/plugins/**/*.ts", "packages/**/*.ts", "test/**/*.ts"]
 }

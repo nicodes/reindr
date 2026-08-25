@@ -1,2 +1,6 @@
 node_modules/
+dist/
+!packages/claude/dist/
+!packages/claude/dist/server.mjs
+artifacts/
 *.log
