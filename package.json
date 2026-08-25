@@ -1,0 +1,28 @@
+{
+  "name": "reindr",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.0",
+  "scripts": {
+    "build:tailwind": "tailwindcss -i .opencode/reindr-tailwind.input.css -o .opencode/reindr-tailwind.css --minify",
+    "pretest": "npm run build:tailwind",
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
+    "test:core": "node --import tsx --test test/core.test.ts",
+    "test:browser": "node --import tsx --test test/browser.test.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.22"
+  },
+  "devDependencies": {
+    "@tailwindcss/cli": "^4.3.3",
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "playwright-core": "^1.55.0",
+    "tailwindcss": "^4.3.3",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "ws": "^8.18.0"
+  }
+}
