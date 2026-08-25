@@ -144,25 +144,6 @@ export function nextMessage(socket: WebSocket, predicate: (message: any) => bool
   })
 }
 
-export function fakeContext(sessionID: string, agent = "build") {
-  const asks: unknown[] = []
-  const metadata: unknown[] = []
-  return {
-    asks,
-    metadataCalls: metadata,
-    context: {
-      sessionID,
-      messageID: `message-${sessionID}`,
-      agent,
-      directory: process.cwd(),
-      worktree: process.cwd(),
-      abort: new AbortController().signal,
-      metadata(value: unknown) { metadata.push(value) },
-      async ask(value: unknown) { asks.push(value) },
-    },
-  }
-}
-
 export function fakeClient(initialStatus: "idle" | "busy" = "idle") {
   const statuses: Record<string, { type: "idle" | "busy" }> = {}
   const prompts: any[] = []
@@ -185,9 +166,4 @@ export function fakeClient(initialStatus: "idle" | "busy" = "idle") {
       },
     },
   }
-}
-
-export function parsePanelURL(result: unknown) {
-  if (!result || typeof result !== "object" || !("metadata" in result)) throw new Error("Tool result has no metadata")
-  return new URL(String((result as { metadata: { url: string } }).metadata.url))
 }

@@ -1,14 +1,26 @@
 import assert from "node:assert/strict"
-import { mkdtemp, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { access, mkdtemp, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import test from "node:test"
 import plugin from "../.opencode/plugins/opencode-generative-ui.ts"
-import { fakeClient, fakeContext, freePort, installBunServeAdapter, nextMessage, openSocket, parsePanelURL, waitForHTTP } from "./harness.ts"
+import { fakeClient, freePort, installBunServeAdapter, nextMessage, openSocket, waitForHTTP } from "./harness.ts"
 
-test("session routing, direct interaction delivery, persistence, and HTTP security", async (t) => {
+async function sessionEnvironment(hooks: Awaited<ReturnType<typeof plugin>>, sessionID: string) {
+  const output = { env: {} as Record<string, string> }
+  await hooks["shell.env"]?.({ cwd: process.cwd(), sessionID, callID: `call-${sessionID}` }, output)
+  return output.env
+}
+
+async function notifyFileEdit(hooks: Awaited<ReturnType<typeof plugin>>, sessionID: string) {
+  await hooks["tool.execute.after"]?.(
+    { tool: "write", sessionID, callID: `write-${sessionID}`, args: {} },
+    { title: "wrote file", output: "", metadata: {} },
+  )
+}
+
+test("file-backed session routing, interaction delivery, and HTTP security", async (t) => {
   const restoreBun = installBunServeAdapter()
-  const stateDirectory = await mkdtemp(path.join(tmpdir(), "opencode-generative-ui-core-"))
+  const canvasDirectory = await mkdtemp(path.join(process.cwd(), ".opencode", "test-ui-core-"))
   const port = await freePort()
   const fake = fakeClient("busy")
   const hooks = await plugin({
@@ -19,32 +31,36 @@ test("session routing, direct interaction delivery, persistence, and HTTP securi
     serverUrl: new URL("http://127.0.0.1:4096"),
     experimental_workspace: { register() {} },
     $: undefined as never,
-  }, { port, autoOpen: false, stateDirectory })
+  }, { port, autoOpen: false, canvasDirectory })
 
   t.after(async () => {
     await hooks.dispose?.()
     restoreBun()
-    await rm(stateDirectory, { recursive: true, force: true })
+    await rm(canvasDirectory, { recursive: true, force: true })
   })
 
-  const render = hooks.tool!.widget_render.execute
-  const first = fakeContext("session-a")
-  const firstResult = await render({
-    id: "settings",
-    title: "Settings",
-    html: `<button onclick="sendPrompt('apply')">Apply</button>`,
-  }, first.context)
-  await render({ id: "status", title: "Status", html: "<p>Ready</p>" }, first.context)
-  await hooks.tool!.widget_layout.execute({
-    css: `#oc-root { grid-template-columns: 2fr 1fr; } [data-widget-id="settings"] { order: 2; }`,
-  }, first.context)
-  assert.equal(first.asks.length, 1, "render permission is requested once per session")
+  assert.equal(hooks.tool, undefined, "the plugin exposes no custom UI authoring tools")
 
-  const second = fakeContext("session-b")
-  await render({ id: "settings", title: "Other settings", html: "<p>Other session</p>" }, second.context)
-  assert.equal(second.asks.length, 1)
+  const system = { system: [] as string[] }
+  await hooks["experimental.chat.system.transform"]?.({ sessionID: "session-a", model: {} as never }, system)
+  const firstEnvironment = await sessionEnvironment(hooks, "session-a")
+  assert.match(system.system.join("\n"), new RegExp(firstEnvironment.OPENCODE_UI_FILE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+  assert.ok(firstEnvironment.OPENCODE_UI_URL)
 
-  const panelURL = parsePanelURL(firstResult)
+  await hooks["chat.message"]?.(
+    { sessionID: "session-a", agent: "build", messageID: "message-a" },
+    { message: {} as never, parts: [] },
+  )
+  await writeFile(firstEnvironment.OPENCODE_UI_FILE, `<!doctype html><html><head><style>main { display: grid; }</style></head><body><main><button>Apply</button><p>Ready</p></main></body></html>`)
+  await notifyFileEdit(hooks, "session-a")
+
+  const secondEnvironment = await sessionEnvironment(hooks, "session-b")
+  assert.notEqual(secondEnvironment.OPENCODE_UI_FILE, firstEnvironment.OPENCODE_UI_FILE)
+  assert.notEqual(secondEnvironment.OPENCODE_UI_URL, firstEnvironment.OPENCODE_UI_URL)
+  await writeFile(secondEnvironment.OPENCODE_UI_FILE, "<main>Other session</main>")
+  await notifyFileEdit(hooks, "session-b")
+
+  const panelURL = new URL(firstEnvironment.OPENCODE_UI_URL)
   const forbidden = await waitForHTTP(`${panelURL.origin}/`)
   assert.equal(forbidden.status, 403)
   const panel = await waitForHTTP(panelURL.href)
@@ -58,22 +74,30 @@ test("session routing, direct interaction delivery, persistence, and HTTP securi
   websocketURL.searchParams.set("session", "session-a")
   const socket = await openSocket(websocketURL.href, panelURL.origin)
   const init = await nextMessage(socket, (message) => message.type === "init")
-  const widget = init.widgets.find((item: any) => item.id === "settings" && item.sessionID === "session-a")
-  assert.ok(widget)
-  assert.equal(init.widgets.filter((item: any) => item.id === "settings").length, 2, "same id is isolated by session")
-  const frameResponse = await fetch(new URL(widget.frameURL, panelURL))
+  assert.equal(init.canvases.length, 1, "a session capability cannot enumerate another session")
+  const canvas = init.canvases.find((item: any) => item.sessionID === "session-a")
+  assert.ok(canvas)
+  const frameResponse = await fetch(new URL(canvas.frameURL, panelURL))
   assert.equal(frameResponse.status, 200)
   assert.match(frameResponse.headers.get("content-security-policy") ?? "", /connect-src 'none'/)
   const frameDocument = await frameResponse.text()
-  assert.match(frameDocument, /sendPrompt|Content-Security-Policy/)
-  assert.match(frameDocument, /data-widget-id="settings"/)
-  assert.match(frameDocument, /data-widget-id="status"/)
-  assert.match(frameDocument, /grid-template-columns: 2fr 1fr/)
+  assert.match(frameDocument, /opencode/)
+  assert.match(frameDocument, /MessageChannel|Content-Security-Policy/)
+  assert.match(frameDocument, /<button>Apply<\/button>/)
   assert.match(frameDocument, /--ui-accent/)
+  assert.doesNotMatch(frameDocument, /data-widget-id|sendPrompt|sendData/)
 
-  socket.send(JSON.stringify({ type: "data", id: widget.id, data: { dryRun: true } }))
+  const crossSessionURL = new URL("/ws", panelURL)
+  crossSessionURL.protocol = "ws:"
+  crossSessionURL.search = panelURL.search
+  crossSessionURL.searchParams.set("session", "session-b")
+  const crossSessionResponse = await fetch(crossSessionURL.href.replace(/^ws:/, "http:"), {
+    headers: { origin: panelURL.origin },
+  })
+  assert.equal(crossSessionResponse.status, 403, "a session token cannot bind to another session")
+
   const queuedPromise = nextMessage(socket, (message) => message.type === "submission-status" && message.status === "queued")
-  socket.send(JSON.stringify({ type: "submit", id: widget.id, text: "Apply settings" }))
+  socket.send(JSON.stringify({ type: "submit", prompt: "Apply settings", data: { dryRun: true } }))
   await queuedPromise
   await new Promise((resolve) => setTimeout(resolve, 50))
   assert.equal(fake.prompts.length, 0, "busy sessions do not receive prompts")
@@ -89,6 +113,5 @@ test("session routing, direct interaction delivery, persistence, and HTTP securi
 
   socket.close()
   await hooks.event?.({ event: { type: "session.deleted", properties: { info: { id: "session-b" } } } as never })
-  const listed = await hooks.tool!.widget_list.execute({}, second.context)
-  assert.match(String(listed), /No widgets/)
+  await assert.rejects(access(secondEnvironment.OPENCODE_UI_FILE))
 })
