@@ -71,7 +71,11 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   )
   const opened = await openReindr(hooks, "session-a")
   assert.equal(typeof opened, "object")
+  const shippedController = await readFile(path.join(process.cwd(), "templates", "opencode-controller.html"), "utf8")
   assert.match(await readFile(firstEnvironment.REINDR_UI_FILE, "utf8"), /OpenCode controller[\s\S]*opencode\.controller/)
+  await writeFile(firstEnvironment.REINDR_UI_FILE, shippedController.trimEnd())
+  await notifyFileEdit(hooks, "session-a")
+  assert.equal(await readFile(firstEnvironment.REINDR_UI_FILE, "utf8"), shippedController, "the shipped controller without its final newline is migrated")
   const authoredHTML = `<!doctype html><html><head><style>main { display: grid; }</style></head><body><main><button>Apply</button><p>Ready</p></main></body></html>`
   await writeFile(firstEnvironment.REINDR_UI_FILE, authoredHTML)
   const reopened = await openReindr(hooks, "session-a")
