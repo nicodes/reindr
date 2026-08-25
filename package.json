@@ -1,0 +1,23 @@
+{
+  "name": "opencode-generative-ui",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
+    "test:core": "node --import tsx --test test/core.test.ts",
+    "test:browser": "node --import tsx --test test/browser.test.ts"
+  },
+  "dependencies": {
+    "@opencode-ai/plugin": "1.18.22"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/ws": "^8.18.1",
+    "playwright-core": "^1.55.0",
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0",
+    "ws": "^8.18.0"
+  }
+}
