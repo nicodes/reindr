@@ -133,22 +133,22 @@ function projectFile(worktree: string, value: string) {
 
 function readConfig(worktree: string, options: PluginOptions | undefined): Config {
   const allowedOption = Array.isArray(options?.allowedAssetHosts) ? options.allowedAssetHosts : []
-  const allowedEnvironment = (process.env.OPENCODE_UI_ALLOWED_ASSET_HOSTS ?? "").split(",")
+  const allowedEnvironment = (process.env.REINDR_ALLOWED_ASSET_HOSTS ?? "").split(",")
   const directoryOption = typeof options?.canvasDirectory === "string" ? options.canvasDirectory : ".opencode/ui"
   return {
-    preferredPort: portOption(process.env.OPENCODE_UI_PORT ?? options?.port, DEFAULT_PORT),
-    autoOpen: booleanOption(process.env.OPENCODE_UI_AUTORAISE ?? options?.autoOpen, true),
+    preferredPort: portOption(process.env.REINDR_PORT ?? options?.port, DEFAULT_PORT),
+    autoOpen: booleanOption(process.env.REINDR_AUTORAISE ?? options?.autoOpen, true),
     browserCommand:
-      typeof process.env.OPENCODE_UI_BROWSER === "string"
-        ? process.env.OPENCODE_UI_BROWSER
+      typeof process.env.REINDR_BROWSER === "string"
+        ? process.env.REINDR_BROWSER
         : typeof options?.browser === "string"
           ? options.browser
           : null,
-    canvasDirectory: projectFile(worktree, process.env.OPENCODE_UI_DIRECTORY ?? directoryOption),
+    canvasDirectory: projectFile(worktree, process.env.REINDR_DIRECTORY ?? directoryOption),
     allowedAssetOrigins: normalizeAssetOrigins([...allowedOption, ...allowedEnvironment]),
     stylesheetPath:
-      typeof process.env.OPENCODE_UI_STYLESHEET === "string"
-        ? process.env.OPENCODE_UI_STYLESHEET
+      typeof process.env.REINDR_STYLESHEET === "string"
+        ? process.env.REINDR_STYLESHEET
         : typeof options?.stylesheetPath === "string"
           ? options.stylesheetPath
           : null,
@@ -219,7 +219,7 @@ const BRIDGE_HTML = `<script>
   var hasOwn = Object.prototype.hasOwnProperty;
   var activation = navigator.userActivation;
   var getIsActive = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(activation), "isActive").get;
-  var getIsTrusted = Object.getOwnPropertyDescriptor(new Event("oc-bridge"), "isTrusted").get;
+  var getIsTrusted = Object.getOwnPropertyDescriptor(new Event("reindr-bridge"), "isTrusted").get;
   var getMessageData = Object.getOwnPropertyDescriptor(MessageEvent.prototype, "data").get;
   var getWindowEvent = Object.getOwnPropertyDescriptor(window, "event").get;
   var defer = setTimeout.bind(window);
@@ -374,7 +374,7 @@ function documentParts(html: string) {
 function canvasDocument(html: string, sharedCSS: string, allowedAssetOrigins: string[]) {
   const parts = documentParts(html)
   const csp = canvasCsp(allowedAssetOrigins).replaceAll("&", "&amp;").replaceAll('"', "&quot;")
-  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer">${BRIDGE_HTML}<style id="oc-default-styles">${safeStyle(DEFAULT_SHARED_CSS)}</style><style id="oc-shared-styles">${safeStyle(sharedCSS)}</style>${parts.head}</head><body>${parts.body}</body></html>`
+  return `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer">${BRIDGE_HTML}<style id="reindr-default-styles">${safeStyle(DEFAULT_SHARED_CSS)}</style><style id="reindr-shared-styles">${safeStyle(sharedCSS)}</style>${parts.head}</head><body>${parts.body}</body></html>`
 }
 
 function shellHtml(nonce: string) {
@@ -384,7 +384,7 @@ function shellHtml(nonce: string) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<title>opencode generative UI</title>
+<title>reindr</title>
 <style>
   :root { --bg: #050505; --panel: #090909; --raised: #111; --hover: #171717; --edge: #242424; --ink: #f4f4f5; --muted: #7c7c82; --accent: #fafafa; --bad: #ff6259; color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -430,7 +430,7 @@ function shellHtml(nonce: string) {
   <button id="session-toggle" type="button" aria-label="Open sessions" title="Sessions" aria-controls="session-drawer" aria-expanded="false">
     <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2.25" y="2.25" width="13.5" height="13.5" rx="2"></rect><path d="M6.25 2.5v13M9.25 6h3.5M9.25 9h3.5M9.25 12h2.25"></path></svg>
   </button>
-  <h1>opencode generative UI</h1>
+  <h1>reindr</h1>
 </header>
 <main id="main"></main>
 <div id="drawer-backdrop"></div>
@@ -707,7 +707,7 @@ function shellHtml(nonce: string) {
 </html>`
 }
 
-const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options) => {
+const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   const config = readConfig(worktree, options)
   const authToken = randomToken()
   const shellNonce = randomToken(18)
@@ -744,7 +744,7 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
   let sessionsSignature = ""
 
   const log = (level: "debug" | "info" | "warn" | "error", message: string, extra?: Record<string, unknown>) =>
-    client.app.log({ body: { service: "opencode-generative-ui", level, message, extra } }).catch(() => {})
+    client.app.log({ body: { service: "reindr", level, message, extra } }).catch(() => {})
 
   const canvasFile = (sessionID: string) => path.join(config.canvasDirectory, canvasFileName(sessionID))
 
@@ -1454,9 +1454,9 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
     "shell.env": async (input, output) => {
       if (!input.sessionID) return
       await registerSession(input.sessionID, true)
-      output.env.OPENCODE_UI_FILE = canvasFile(input.sessionID)
+      output.env.REINDR_UI_FILE = canvasFile(input.sessionID)
       const url = sessionURL(input.sessionID)
-      if (url) output.env.OPENCODE_UI_URL = url
+      if (url) output.env.REINDR_UI_URL = url
     },
 
     "tool.execute.after": async (input) => {
@@ -1466,4 +1466,4 @@ const OpencodeGenerativeUIPlugin: Plugin = async ({ client, worktree }, options)
   }
 }
 
-export default OpencodeGenerativeUIPlugin
+export default ReindrPlugin

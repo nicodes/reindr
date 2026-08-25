@@ -1,16 +1,16 @@
-# opencode-generative-ui
+# reindr
 
 A prototype OpenCode plugin that gives each agent session an editable HTML file and displays it in a companion Chromium panel. The file is the interface: the agent uses normal filesystem tools to write HTML, CSS, and JavaScript, while the plugin handles discovery, live reload, sandboxing, session routing, and browser-to-agent interactions.
 
 The runtime implementation is one file:
 
 ```text
-.opencode/plugins/opencode-generative-ui.ts
+.opencode/plugins/reindr.ts
 ```
 
 ## Prototype Status
 
-The source plugin works as a project-local OpenCode plugin. The `opencode-generative-ui` npm name and package metadata are prepared for development, but this repository is not yet a published npm plugin.
+The source plugin works as a project-local OpenCode plugin. The `reindr` npm name and package metadata are prepared for development, but this repository is not yet a published npm plugin.
 
 The prototype targets OpenCode `1.18.22` and Chromium desktop.
 
@@ -24,13 +24,13 @@ To try it in another project, copy the plugin file:
 your-project/
   .opencode/
     plugins/
-      opencode-generative-ui.ts
+      reindr.ts
 ```
 
 For a global source installation, copy it to:
 
 ```text
-~/.config/opencode/plugins/opencode-generative-ui.ts
+~/.config/opencode/plugins/reindr.ts
 ```
 
 OpenCode loads plugin files only at startup, so restart it after installing or changing the plugin.
@@ -46,8 +46,8 @@ Ask the agent to build an interface:
 The plugin adds the current session's exact UI file path and panel URL to the agent's system instructions. It also exports them to shell commands as:
 
 ```text
-OPENCODE_UI_FILE
-OPENCODE_UI_URL
+REINDR_UI_FILE
+REINDR_UI_URL
 ```
 
 The default file location is:
@@ -127,12 +127,12 @@ Secure defaults require no configuration.
 
 | Environment variable | Default | Meaning |
 |---|---:|---|
-| `OPENCODE_UI_PORT` | `4917` | Preferred panel port. Use `0` for a dynamic port. An occupied preferred port falls back automatically. |
-| `OPENCODE_UI_AUTORAISE` | `1` | Set to `0` to disable automatic browser opening. |
-| `OPENCODE_UI_BROWSER` | platform default | Browser command. Use `{url}` where the panel URL should be inserted. |
-| `OPENCODE_UI_DIRECTORY` | `.opencode/ui` | Directory containing per-session HTML files. It must remain inside the project worktree. |
-| `OPENCODE_UI_ALLOWED_ASSET_HOSTS` | empty | Comma-separated HTTPS hosts allowed to serve static assets. |
-| `OPENCODE_UI_STYLESHEET` | empty | Local CSS file inserted before each session file's styles. Relative paths resolve from the project worktree. |
+| `REINDR_PORT` | `4917` | Preferred panel port. Use `0` for a dynamic port. An occupied preferred port falls back automatically. |
+| `REINDR_AUTORAISE` | `1` | Set to `0` to disable automatic browser opening. |
+| `REINDR_BROWSER` | platform default | Browser command. Use `{url}` where the panel URL should be inserted. |
+| `REINDR_DIRECTORY` | `.opencode/ui` | Directory containing per-session HTML files. It must remain inside the project worktree. |
+| `REINDR_ALLOWED_ASSET_HOSTS` | empty | Comma-separated HTTPS hosts allowed to serve static assets. |
+| `REINDR_STYLESHEET` | empty | Local CSS file inserted before each session file's styles. Relative paths resolve from the project worktree. |
 
 The eventual npm package also accepts plugin options:
 
@@ -141,13 +141,13 @@ The eventual npm package also accepts plugin options:
   "$schema": "https://opencode.ai/config.json",
   "plugin": [
     [
-      "opencode-generative-ui",
+      "reindr",
       {
         "port": 4917,
         "autoOpen": true,
         "browser": "chromium --app={url}",
         "canvasDirectory": ".opencode/ui",
-        "stylesheetPath": ".opencode/generative-ui.css",
+        "stylesheetPath": ".opencode/reindr.css",
         "allowedAssetHosts": ["cdn.jsdelivr.net"]
       }
     ]
@@ -184,7 +184,7 @@ The CSP blocks `fetch`, WebSocket, form submission, and similar connection APIs.
 - `/frame/<session-key>?token=...` serves the sandboxed session HTML with a limited read token.
 - `/ws?token=...` carries live updates and interactions.
 
-Capability URLs expire when the OpenCode process exits. The current URL is reinjected into agent instructions and `OPENCODE_UI_URL` after restart.
+Capability URLs expire when the OpenCode process exits. The current URL is reinjected into agent instructions and `REINDR_UI_URL` after restart.
 
 ## Develop
 

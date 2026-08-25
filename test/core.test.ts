@@ -2,7 +2,7 @@ import assert from "node:assert/strict"
 import { access, mkdtemp, rm, writeFile } from "node:fs/promises"
 import path from "node:path"
 import test from "node:test"
-import plugin from "../.opencode/plugins/opencode-generative-ui.ts"
+import plugin from "../.opencode/plugins/reindr.ts"
 import { fakeClient, freePort, installBunServeAdapter, nextMessage, openSocket, waitForHTTP } from "./harness.ts"
 
 async function sessionEnvironment(hooks: Awaited<ReturnType<typeof plugin>>, sessionID: string) {
@@ -44,24 +44,24 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   const system = { system: [] as string[] }
   await hooks["experimental.chat.system.transform"]?.({ sessionID: "session-a", model: {} as never }, system)
   const firstEnvironment = await sessionEnvironment(hooks, "session-a")
-  assert.match(system.system.join("\n"), new RegExp(firstEnvironment.OPENCODE_UI_FILE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
-  assert.ok(firstEnvironment.OPENCODE_UI_URL)
+  assert.match(system.system.join("\n"), new RegExp(firstEnvironment.REINDR_UI_FILE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+  assert.ok(firstEnvironment.REINDR_UI_URL)
 
   await hooks["chat.message"]?.(
     { sessionID: "session-a", agent: "build", messageID: "message-a" },
     { message: {} as never, parts: [] },
   )
-  await writeFile(firstEnvironment.OPENCODE_UI_FILE, `<!doctype html><html><head><style>main { display: grid; }</style></head><body><main><button>Apply</button><p>Ready</p></main></body></html>`)
+  await writeFile(firstEnvironment.REINDR_UI_FILE, `<!doctype html><html><head><style>main { display: grid; }</style></head><body><main><button>Apply</button><p>Ready</p></main></body></html>`)
   await notifyFileEdit(hooks, "session-a")
 
   const secondEnvironment = await sessionEnvironment(hooks, "session-b")
-  assert.notEqual(secondEnvironment.OPENCODE_UI_FILE, firstEnvironment.OPENCODE_UI_FILE)
-  assert.notEqual(secondEnvironment.OPENCODE_UI_URL, firstEnvironment.OPENCODE_UI_URL)
-  assert.equal(new URL(secondEnvironment.OPENCODE_UI_URL).search, new URL(firstEnvironment.OPENCODE_UI_URL).search)
-  await writeFile(secondEnvironment.OPENCODE_UI_FILE, "<main>Other session</main>")
+  assert.notEqual(secondEnvironment.REINDR_UI_FILE, firstEnvironment.REINDR_UI_FILE)
+  assert.notEqual(secondEnvironment.REINDR_UI_URL, firstEnvironment.REINDR_UI_URL)
+  assert.equal(new URL(secondEnvironment.REINDR_UI_URL).search, new URL(firstEnvironment.REINDR_UI_URL).search)
+  await writeFile(secondEnvironment.REINDR_UI_FILE, "<main>Other session</main>")
   await notifyFileEdit(hooks, "session-b")
 
-  const panelURL = new URL(firstEnvironment.OPENCODE_UI_URL)
+  const panelURL = new URL(firstEnvironment.REINDR_UI_URL)
   const forbidden = await waitForHTTP(`${panelURL.origin}/`)
   assert.equal(forbidden.status, 403)
   const panel = await waitForHTTP(panelURL.href)
@@ -114,7 +114,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
 
   socket.close()
   await hooks.event?.({ event: { type: "session.deleted", properties: { info: { id: "session-b" } } } as never })
-  await assert.rejects(access(secondEnvironment.OPENCODE_UI_FILE))
+  await assert.rejects(access(secondEnvironment.REINDR_UI_FILE))
 })
 
 test("panel registry links sessions served by different plugin ports", async (t) => {
@@ -145,13 +145,13 @@ test("panel registry links sessions served by different plugin ports", async (t)
 
   const firstEnvironment = await sessionEnvironment(firstHooks, "registry-a")
   const secondEnvironment = await sessionEnvironment(secondHooks, "registry-b")
-  await writeFile(firstEnvironment.OPENCODE_UI_FILE, "<main>Registry A</main>")
+  await writeFile(firstEnvironment.REINDR_UI_FILE, "<main>Registry A</main>")
   await notifyFileEdit(firstHooks, "registry-a")
-  await writeFile(secondEnvironment.OPENCODE_UI_FILE, "<main>Registry B</main>")
+  await writeFile(secondEnvironment.REINDR_UI_FILE, "<main>Registry B</main>")
   await notifyFileEdit(secondHooks, "registry-b")
   await new Promise((resolve) => setTimeout(resolve, 150))
 
-  const firstPanelURL = new URL(firstEnvironment.OPENCODE_UI_URL)
+  const firstPanelURL = new URL(firstEnvironment.REINDR_UI_URL)
   const socketURL = new URL("/ws", firstPanelURL)
   socketURL.protocol = "ws:"
   socketURL.search = firstPanelURL.search
@@ -159,7 +159,7 @@ test("panel registry links sessions served by different plugin ports", async (t)
   const socket = await openSocket(socketURL.href, firstPanelURL.origin)
   const init = await nextMessage(socket, (message) => message.type === "init")
   const origins = new Set(init.sessions.map((session: any) => new URL(session.url).origin))
-  assert.deepEqual(origins, new Set([new URL(firstEnvironment.OPENCODE_UI_URL).origin, new URL(secondEnvironment.OPENCODE_UI_URL).origin]))
+  assert.deepEqual(origins, new Set([new URL(firstEnvironment.REINDR_UI_URL).origin, new URL(secondEnvironment.REINDR_UI_URL).origin]))
   assert.equal(init.sessions.length, 2)
   socket.close()
 })
