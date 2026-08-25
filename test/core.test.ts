@@ -1,5 +1,6 @@
 import assert from "node:assert/strict"
-import { access, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { access, mkdtemp, readFile, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
 import path from "node:path"
 import test from "node:test"
 import plugin from "../.opencode/plugins/reindr.ts"
@@ -18,9 +19,25 @@ async function notifyFileEdit(hooks: Awaited<ReturnType<typeof plugin>>, session
   )
 }
 
+async function openReindr(hooks: Awaited<ReturnType<typeof plugin>>, sessionID: string, template?: string) {
+  const lifecycle = hooks.tool?.reindr_open
+  assert.ok(lifecycle)
+  return lifecycle.execute(template ? { template } : {}, {
+    sessionID,
+    messageID: `message-${sessionID}`,
+    agent: "build",
+    directory: process.cwd(),
+    worktree: process.cwd(),
+    abort: new AbortController().signal,
+    metadata() {},
+    async ask() {},
+  })
+}
+
 test("file-backed session routing, interaction delivery, and HTTP security", async (t) => {
   const restoreBun = installBunServeAdapter()
   const canvasDirectory = await mkdtemp(path.join(process.cwd(), ".opencode", "test-ui-core-"))
+  const templateDirectory = path.join(canvasDirectory, "templates")
   const port = await freePort()
   const fake = fakeClient("busy")
   const hooks = await plugin({
@@ -31,7 +48,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
     serverUrl: new URL("http://127.0.0.1:4096"),
     experimental_workspace: { register() {} },
     $: undefined as never,
-  }, { port, autoOpen: false, canvasDirectory })
+  }, { port, autoOpen: false, canvasDirectory, templateDirectory })
 
   t.after(async () => {
     await hooks.dispose?.()
@@ -39,7 +56,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
     await rm(canvasDirectory, { recursive: true, force: true })
   })
 
-  assert.equal(hooks.tool, undefined, "the plugin exposes no custom UI authoring tools")
+  assert.deepEqual(Object.keys(hooks.tool ?? {}), ["reindr_open"], "the plugin exposes only its lifecycle tool")
 
   const system = { system: [] as string[] }
   await hooks["experimental.chat.system.transform"]?.({ sessionID: "session-a", model: {} as never }, system)
@@ -51,8 +68,14 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
     { sessionID: "session-a", agent: "build", messageID: "message-a" },
     { message: {} as never, parts: [] },
   )
-  await writeFile(firstEnvironment.REINDR_UI_FILE, `<!doctype html><html><head><style>main { display: grid; }</style></head><body><main><button>Apply</button><p>Ready</p></main></body></html>`)
-  await notifyFileEdit(hooks, "session-a")
+  const opened = await openReindr(hooks, "session-a")
+  assert.equal(typeof opened, "object")
+  assert.match(await readFile(firstEnvironment.REINDR_UI_FILE, "utf8"), /OpenCode controller[\s\S]*opencode\.controller/)
+  const authoredHTML = `<!doctype html><html><head><style>main { display: grid; }</style></head><body><main><button>Apply</button><p>Ready</p></main></body></html>`
+  await writeFile(firstEnvironment.REINDR_UI_FILE, authoredHTML)
+  const reopened = await openReindr(hooks, "session-a")
+  assert.equal(typeof reopened, "object")
+  assert.equal(await readFile(firstEnvironment.REINDR_UI_FILE, "utf8"), authoredHTML, "reindr_open never overwrites an existing UI")
 
   const secondEnvironment = await sessionEnvironment(hooks, "session-b")
   assert.notEqual(secondEnvironment.REINDR_UI_FILE, firstEnvironment.REINDR_UI_FILE)
@@ -62,8 +85,33 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   await notifyFileEdit(hooks, "session-b")
 
   const panelURL = new URL(firstEnvironment.REINDR_UI_URL)
-  const forbidden = await waitForHTTP(`${panelURL.origin}/`)
-  assert.equal(forbidden.status, 403)
+  const landing = await waitForHTTP(`${panelURL.origin}/`)
+  assert.equal(landing.status, 200)
+  assert.equal(landing.headers.get("x-frame-options"), "DENY")
+  assert.match(landing.headers.get("content-security-policy") ?? "", /default-src 'none'/)
+  const landingDocument = await landing.text()
+  assert.match(landingDocument, /Reindr[\s\S]*Start a session to get started\./)
+  assert.match(landingDocument, /Session session-a/, "the landing page links session A")
+  assert.match(landingDocument, /Session session-b/, "the landing page links session B")
+  const templatePreviewURL = new URL("/template/opencode-controller.html", panelURL)
+  templatePreviewURL.search = panelURL.search
+  const templatePreview = await fetch(templatePreviewURL)
+  assert.equal(templatePreview.status, 200)
+  assert.match(templatePreview.headers.get("content-security-policy") ?? "", /frame-src 'self'/)
+  assert.match(await templatePreview.text(), /Read-only preview[\s\S]*Template preview: opencode-controller\.html/)
+  const forbiddenTemplateFrame = await fetch(new URL("/template-frame/opencode-controller.html", panelURL))
+  assert.equal(forbiddenTemplateFrame.status, 403)
+  const templateFrameURL = new URL("/template-frame/opencode-controller.html", panelURL)
+  templateFrameURL.search = panelURL.search
+  const templateFrame = await fetch(templateFrameURL)
+  assert.equal(templateFrame.status, 200)
+  assert.match(await templateFrame.text(), /OpenCode controller[\s\S]*opencode\.controller/)
+  const staleSession = await fetch(new URL("/s/missing-session", panelURL))
+  assert.equal(staleSession.status, 200)
+  assert.match(await staleSession.text(), /Running Reindr sessions[\s\S]*Session session-a/)
+  const unknownRoute = await fetch(`${panelURL.origin}/not-a-session`)
+  assert.equal(unknownRoute.status, 200)
+  assert.match(await unknownRoute.text(), /Start a session to get started\./)
   const panel = await waitForHTTP(panelURL.href)
   assert.equal(panel.status, 200)
   assert.equal(panel.headers.get("x-frame-options"), "DENY")
@@ -75,14 +123,18 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   websocketURL.searchParams.set("session", "session-a")
   const socket = await openSocket(websocketURL.href, panelURL.origin)
   const init = await nextMessage(socket, (message) => message.type === "init")
-  assert.equal(init.canvases.length, 2, "the project panel exposes every local session")
+  assert.equal(init.canvases.length, 2, "the panel exposes every session active in this process")
   const canvas = init.canvases.find((item: any) => item.sessionID === "session-a")
   assert.ok(canvas)
+  const forbiddenFrameURL = new URL(canvas.frameURL)
+  forbiddenFrameURL.search = ""
+  assert.equal((await fetch(forbiddenFrameURL)).status, 403, "frame routes still require a capability token")
   const frameResponse = await fetch(new URL(canvas.frameURL, panelURL))
   assert.equal(frameResponse.status, 200)
   assert.match(frameResponse.headers.get("content-security-policy") ?? "", /connect-src 'none'/)
   const frameDocument = await frameResponse.text()
   assert.match(frameDocument, /opencode/)
+  assert.match(frameDocument, /tailwindcss v4/)
   assert.match(frameDocument, /MessageChannel|Content-Security-Policy/)
   assert.match(frameDocument, /<button>Apply<\/button>/)
   assert.match(frameDocument, /--ui-accent/)
@@ -117,9 +169,100 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   await assert.rejects(access(secondEnvironment.REINDR_UI_FILE))
 })
 
+test("the same session reuses its global UI file across worktrees", async (t) => {
+  const restoreBun = installBunServeAdapter()
+  const dataDirectory = await mkdtemp(path.join(tmpdir(), "reindr-data-"))
+  const firstWorktree = await mkdtemp(path.join(tmpdir(), "reindr-worktree-a-"))
+  const secondWorktree = await mkdtemp(path.join(tmpdir(), "reindr-worktree-b-"))
+  const previousDataHome = process.env.XDG_DATA_HOME
+  const previousDirectory = process.env.REINDR_DIRECTORY
+  const previousTemplateDirectory = process.env.REINDR_TEMPLATE_DIRECTORY
+  process.env.XDG_DATA_HOME = dataDirectory
+  delete process.env.REINDR_DIRECTORY
+  delete process.env.REINDR_TEMPLATE_DIRECTORY
+  let activeHooks: Awaited<ReturnType<typeof plugin>> | null = null
+
+  t.after(async () => {
+    await activeHooks?.dispose?.()
+    restoreBun()
+    if (previousDataHome === undefined) delete process.env.XDG_DATA_HOME
+    else process.env.XDG_DATA_HOME = previousDataHome
+    if (previousDirectory === undefined) delete process.env.REINDR_DIRECTORY
+    else process.env.REINDR_DIRECTORY = previousDirectory
+    if (previousTemplateDirectory === undefined) delete process.env.REINDR_TEMPLATE_DIRECTORY
+    else process.env.REINDR_TEMPLATE_DIRECTORY = previousTemplateDirectory
+    await rm(dataDirectory, { recursive: true, force: true })
+    await rm(firstWorktree, { recursive: true, force: true })
+    await rm(secondWorktree, { recursive: true, force: true })
+  })
+
+  const fake = fakeClient("idle")
+  const pluginInput = (worktree: string) => ({
+    client: fake.client as never,
+    project: { id: "shared-project" } as never,
+    directory: worktree,
+    worktree,
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    experimental_workspace: { register() {} },
+    $: undefined as never,
+  })
+
+  activeHooks = await plugin(pluginInput(firstWorktree), { port: await freePort(), autoOpen: false })
+  const firstEnvironment = await sessionEnvironment(activeHooks, "ses_shared")
+  const expectedFile = path.join(dataDirectory, "reindr", "sessions", "ses_shared.html")
+  const loadingTemplateFile = path.join(dataDirectory, "reindr", "templates", "reindr-loading.html")
+  const controllerTemplateFile = path.join(dataDirectory, "reindr", "templates", "opencode-controller.html")
+  assert.equal(firstEnvironment.REINDR_UI_FILE, expectedFile)
+  assert.match(await readFile(loadingTemplateFile, "utf8"), /Preparing your interface[\s\S]*\{\{sessionTitle\}\}/)
+  assert.match(await readFile(controllerTemplateFile, "utf8"), /OpenCode controller[\s\S]*opencode\.controller/)
+  assert.doesNotMatch(await readFile(loadingTemplateFile, "utf8"), /<style>/)
+  assert.doesNotMatch(await readFile(controllerTemplateFile, "utf8"), /<style>/)
+  const runtimeConfig = {} as { permission?: { external_directory?: Record<string, string> } }
+  await activeHooks.config?.(runtimeConfig as never)
+  assert.equal(runtimeConfig.permission?.external_directory?.[path.join(path.dirname(expectedFile), "*.html")], "allow")
+  const deniedConfig = { permission: { external_directory: "deny" } }
+  await activeHooks.config?.(deniedConfig as never)
+  assert.equal(deniedConfig.permission.external_directory, "deny", "an explicit external-directory denial is preserved")
+  await writeFile(expectedFile, "<main>Persisted session UI</main>")
+  await notifyFileEdit(activeHooks, "ses_shared")
+  const customTemplate = "<main>Custom loading view for {{sessionTitle}}</main>"
+  const customController = "<main>Custom controller template</main>"
+  await writeFile(loadingTemplateFile, customTemplate)
+  await writeFile(controllerTemplateFile, customController)
+  await activeHooks.dispose?.()
+  activeHooks = null
+
+  activeHooks = await plugin(pluginInput(secondWorktree), { port: await freePort(), autoOpen: false })
+  assert.equal(await readFile(loadingTemplateFile, "utf8"), customTemplate, "plugin restart preserves the saved template")
+  assert.equal(await readFile(controllerTemplateFile, "utf8"), customController, "controller migration preserves customized templates")
+  const system = { system: [] as string[] }
+  await activeHooks["experimental.chat.system.transform"]?.({ sessionID: "ses_shared", model: {} as never }, system)
+  const secondEnvironment = await sessionEnvironment(activeHooks, "ses_shared")
+  assert.equal(secondEnvironment.REINDR_UI_FILE, expectedFile)
+  assert.match(system.system.join("\n"), new RegExp(expectedFile.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+
+  const panelURL = new URL(secondEnvironment.REINDR_UI_URL)
+  const socketURL = new URL("/ws", panelURL)
+  socketURL.protocol = "ws:"
+  socketURL.search = panelURL.search
+  socketURL.searchParams.set("session", "ses_shared")
+  const socket = await openSocket(socketURL.href, panelURL.origin)
+  const init = await nextMessage(socket, (message) => message.type === "init")
+  const canvas = init.canvases.find((item: any) => item.sessionID === "ses_shared")
+  assert.ok(canvas, "the resumed session discovers its existing UI")
+  const frame = await fetch(canvas.frameURL)
+  assert.match(await frame.text(), /Persisted session UI/)
+  socket.close()
+
+  const templateEnvironment = await sessionEnvironment(activeHooks, "ses_template")
+  await openReindr(activeHooks, "ses_template", "reindr-loading.html")
+  assert.equal(await readFile(templateEnvironment.REINDR_UI_FILE, "utf8"), "<main>Custom loading view for Session ses_template</main>")
+})
+
 test("panel registry links sessions served by different plugin ports", async (t) => {
   const restoreBun = installBunServeAdapter()
   const canvasDirectory = await mkdtemp(path.join(process.cwd(), ".opencode", "test-ui-registry-"))
+  const templateDirectory = path.join(canvasDirectory, "templates")
   const firstPort = await freePort()
   const firstFake = fakeClient("idle")
   const secondFake = fakeClient("idle")
@@ -132,9 +275,9 @@ test("panel registry links sessions served by different plugin ports", async (t)
     experimental_workspace: { register() {} },
     $: undefined as never,
   })
-  const firstHooks = await plugin(pluginInput(firstFake.client), { port: firstPort, autoOpen: false, canvasDirectory })
+  const firstHooks = await plugin(pluginInput(firstFake.client), { port: firstPort, autoOpen: false, canvasDirectory, templateDirectory })
   const secondPort = await freePort()
-  const secondHooks = await plugin(pluginInput(secondFake.client), { port: secondPort, autoOpen: false, canvasDirectory })
+  const secondHooks = await plugin(pluginInput(secondFake.client), { port: secondPort, autoOpen: false, canvasDirectory, templateDirectory })
 
   t.after(async () => {
     await secondHooks.dispose?.()

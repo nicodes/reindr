@@ -147,22 +147,84 @@ export function nextMessage(socket: WebSocket, predicate: (message: any) => bool
 export function fakeClient(initialStatus: "idle" | "busy" = "idle") {
   const statuses: Record<string, { type: "idle" | "busy" }> = {}
   const prompts: any[] = []
+  const commands: any[] = []
+  const aborts: string[] = []
   const logs: any[] = []
   return {
     statuses,
     prompts,
+    commands,
+    aborts,
     logs,
     client: {
       app: {
         async log(input: unknown) { logs.push(input); return { data: true } },
+        async agents() {
+          return { data: [
+            { name: "build", description: "Build agent", mode: "primary", builtIn: true, permission: {}, tools: {}, options: {} },
+            { name: "explore", description: "Explore subagent", mode: "subagent", builtIn: true, permission: {}, tools: {}, options: {} },
+          ] }
+        },
+      },
+      provider: {
+        async list() {
+          return { data: {
+            all: [{
+              id: "test-provider",
+              name: "Test Provider",
+              env: [],
+              models: {
+                "test-model": {
+                  id: "test-model",
+                  name: "Test Model",
+                  release_date: "2026-01-01",
+                  attachment: true,
+                  reasoning: true,
+                  temperature: true,
+                  tool_call: true,
+                  limit: { context: 100_000, output: 10_000 },
+                  options: {},
+                },
+              },
+            }],
+            default: { "test-provider": "test-model" },
+            connected: ["test-provider"],
+          } }
+        },
+      },
+      command: {
+        async list() {
+          return { data: [{ name: "test-command", description: "Run the test command", template: "Test $ARGUMENTS" }] }
+        },
       },
       session: {
         async get(input: { path: { id: string } }) {
           statuses[input.path.id] ??= { type: initialStatus }
-          return { data: { id: input.path.id, title: `Session ${input.path.id}` } }
+          return { data: { id: input.path.id, projectID: "test-project", directory: process.cwd(), title: `Session ${input.path.id}`, time: { created: 1, updated: 2 } } }
         },
         async status() { return { data: statuses } },
+        async messages(input: { path: { id: string } }) {
+          return { data: [
+            {
+              info: { id: `user-${input.path.id}`, sessionID: input.path.id, role: "user", time: { created: 1 }, agent: "build", model: { providerID: "test-provider", modelID: "test-model" } },
+              parts: [{ id: "text-1", sessionID: input.path.id, messageID: `user-${input.path.id}`, type: "text", text: "History prompt" }],
+            },
+            {
+              info: { id: `assistant-${input.path.id}`, sessionID: input.path.id, role: "assistant", time: { created: 2, completed: 3 }, parentID: `user-${input.path.id}`, providerID: "test-provider", modelID: "test-model", mode: "build", path: { cwd: process.cwd(), root: process.cwd() }, cost: 0.01, tokens: { input: 10, output: 20, reasoning: 5, cache: { read: 0, write: 0 } }, finish: "stop" },
+              parts: [
+                { id: "reasoning-1", sessionID: input.path.id, messageID: `assistant-${input.path.id}`, type: "reasoning", text: "Reasoning trace", time: { start: 2, end: 3 } },
+                { id: "tool-1", sessionID: input.path.id, messageID: `assistant-${input.path.id}`, type: "tool", callID: "call-1", tool: "bash", state: { status: "completed", input: { command: "npm test" }, output: "Tests passed", title: "Run tests", metadata: {}, time: { start: 2, end: 3 } } },
+                { id: "subtask-1", sessionID: input.path.id, messageID: `assistant-${input.path.id}`, type: "subtask", prompt: "Inspect the code", description: "Explore code", agent: "explore" },
+              ],
+            },
+          ] }
+        },
+        async children(input: { path: { id: string } }) {
+          return { data: [{ id: `${input.path.id}-child`, projectID: "test-project", directory: process.cwd(), parentID: input.path.id, title: "Explore child", version: "1", time: { created: 2, updated: 3 } }] }
+        },
         async promptAsync(input: unknown) { prompts.push(input); return { data: undefined } },
+        async command(input: unknown) { commands.push(input); return { data: { info: {}, parts: [] } } },
+        async abort(input: { path: { id: string } }) { aborts.push(input.path.id); return { data: true } },
       },
     },
   }
