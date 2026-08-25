@@ -503,6 +503,7 @@ const BRIDGE_HTML = `<script>
   var stringify = JSON.stringify;
   var parse = JSON.parse;
   var hasOwn = Object.prototype.hasOwnProperty;
+  var getEventPhase = Object.getOwnPropertyDescriptor(Event.prototype, "eventPhase").get;
   var getIsTrusted = Object.getOwnPropertyDescriptor(new Event("reindr-bridge"), "isTrusted").get;
   var getMessageData = Object.getOwnPropertyDescriptor(MessageEvent.prototype, "data").get;
   var defer = setTimeout.bind(window);
@@ -515,7 +516,7 @@ const BRIDGE_HTML = `<script>
     return false;
   }
   function consumeActivation(name) {
-    if (!activeEvent) {
+    if (!activeEvent || !apply(getEventPhase, activeEvent, [])) {
       fail(name + " requires a user click or form submission.");
       return false;
     }
