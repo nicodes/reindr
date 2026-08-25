@@ -87,8 +87,8 @@ const MAX_CANVAS_HTML_BYTES = 1_000_000
 const MAX_STYLESHEET_BYTES = 200_000
 const MAX_DATA_BYTES = 64_000
 const MAX_PENDING_SUBMISSIONS = 100
-const REGISTRY_HEARTBEAT_MS = 5_000
-const REGISTRY_STALE_MS = 20_000
+const REGISTRY_HEARTBEAT_MS = 3_000
+const REGISTRY_STALE_MS = 10_000
 
 function booleanOption(value: unknown, fallback: boolean) {
   if (typeof value === "boolean") return value
