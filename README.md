@@ -12,13 +12,13 @@ packages/claude/     self-contained Claude Code marketplace plugin
 
 ## Prototype Status
 
-The OpenCode npm packages and Claude Code marketplace plugin are complete and prepared for their first `0.0.1` release. They are not published yet.
+Version `0.0.1` is available as [`@nicodes/reindr-core`](https://www.npmjs.com/package/@nicodes/reindr-core), [`@nicodes/reindr-opencode`](https://www.npmjs.com/package/@nicodes/reindr-opencode), and the `nicodes/reindr` Claude Code marketplace plugin.
 
-The prototype targets OpenCode `1.18.22` and Chromium desktop.
+The prototype targets OpenCode `1.18.22`, Claude Code marketplace plugins, and Chromium desktop.
 
 ## Install For OpenCode
 
-Add the adapter to `~/.config/opencode/opencode.json` for every project, or to a project-root `opencode.json` for one project:
+Add the published [`@nicodes/reindr-opencode`](https://www.npmjs.com/package/@nicodes/reindr-opencode) adapter to `~/.config/opencode/opencode.json` for every project, or to a project-root `opencode.json` for one project:
 
 ```json
 {
