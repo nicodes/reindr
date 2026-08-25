@@ -3,7 +3,7 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "opencode-generative-ui",
+      "name": "reindr",
       "dependencies": {
         "@opencode-ai/plugin": "1.18.22",
       },
