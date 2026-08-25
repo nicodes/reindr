@@ -253,9 +253,9 @@ The core suite runs the real OpenCode plugin through an HTTP/WebSocket Bun adapt
 
 ## Publish
 
-The **Publish packages** GitHub Actions workflow is manually triggerable from the `main` branch. Choose `all`, `core`, or `opencode`; dry-run mode is enabled by default. A real publish reruns every release check, refuses an existing version, publishes core before the OpenCode adapter when `all` is selected, and records npm provenance.
+The **Release** GitHub Actions workflow is manually triggerable from the `main` branch. Choose `all`, `core`, or `opencode`; dry-run mode is enabled by default. A real publish reruns every release check, refuses an existing version, publishes core before the OpenCode adapter when `all` is selected, and records npm provenance.
 
-Add an `NPM_TOKEN` Actions secret before the first real run. It must be an npm granular access token allowed to publish both `@nicodes` packages and configured to bypass 2FA for automation. The committed package manifests remain the source of truth for versions; the workflow never edits versions or tags.
+Both npm packages use Trusted Publishing with GitHub user `nicodes`, repository `reindr`, workflow `release.yml`, no GitHub environment, and the `npm publish` action allowed. Releases use short-lived OIDC credentials instead of an npm token. The committed package manifests remain the source of truth for versions; the workflow never edits versions or tags.
 
 The Claude plugin is not an npm release target. Its versioned marketplace files become available when they are merged to the repository's default branch.
 
@@ -266,4 +266,3 @@ The Claude plugin is not an npm release target. Its versioned marketplace files 
 - Full-file updates preserve basic form/focus/scroll state, not JavaScript heap state or event state.
 - Full-document normalization preserves head/body contents and escaped `class` attributes for Tailwind; other original `html` and `body` attributes are discarded.
 - CDN assets require explicit trusted-host configuration.
-- The packages are prepared but remain unpublished until the initial `0.0.1` release is completed.

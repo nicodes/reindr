@@ -30,7 +30,7 @@ jobs:
     timeout-minutes: 30
     permissions:
       contents: read
-      id-token: write # npm provenance
+      id-token: write # npm trusted publishing and provenance
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -87,12 +87,6 @@ jobs:
           npx --yes @anthropic-ai/claude-code@2.1.239 plugin validate packages/claude --strict
           npx --yes @anthropic-ai/claude-code@2.1.239 plugin validate . --strict
 
-      - name: Verify npm authentication
-        if: ${{ inputs.dry_run == false }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm whoami
-
       - name: Refuse existing versions
         if: ${{ inputs.dry_run == false }}
         env:
@@ -132,12 +126,8 @@ jobs:
 
       - name: Publish core
         if: ${{ inputs.dry_run == false && (inputs.target == 'all' || inputs.target == 'core') }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --workspace @nicodes/reindr-core --access public --provenance
+        run: npm publish --workspace @nicodes/reindr-core --access public
 
       - name: Publish OpenCode adapter
         if: ${{ inputs.dry_run == false && (inputs.target == 'all' || inputs.target == 'opencode') }}
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --workspace @nicodes/reindr-opencode --access public --provenance
+        run: npm publish --workspace @nicodes/reindr-opencode --access public
