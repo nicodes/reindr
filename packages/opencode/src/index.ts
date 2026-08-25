@@ -507,7 +507,6 @@ const BRIDGE_HTML = `<script>
   var getIsActive = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(activation), "isActive").get;
   var getIsTrusted = Object.getOwnPropertyDescriptor(new Event("reindr-bridge"), "isTrusted").get;
   var getMessageData = Object.getOwnPropertyDescriptor(MessageEvent.prototype, "data").get;
-  var getWindowEvent = Object.getOwnPropertyDescriptor(window, "event").get;
   var defer = setTimeout.bind(window);
   var NativePromise = Promise;
   function post(message) {
@@ -518,7 +517,7 @@ const BRIDGE_HTML = `<script>
     return false;
   }
   function consumeActivation(name) {
-    if (!activeEvent || apply(getWindowEvent, window, []) !== activeEvent) {
+    if (!activeEvent) {
       fail(name + " requires a user click or form submission.");
       return false;
     }
