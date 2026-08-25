@@ -111,6 +111,11 @@ const REGISTRY_STALE_MS = 10_000
 const BUILT_IN_TAILWIND_STYLESHEET = new URL("../reindr-tailwind.css", import.meta.url)
 const BUILT_IN_LOADING_TEMPLATE = new URL("../../templates/reindr-loading.html", import.meta.url)
 const BUILT_IN_CONTROLLER_TEMPLATE = new URL("../../templates/opencode-controller.html", import.meta.url)
+const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <path fill="#101513" d="M16 3 28 10v12L16 29 4 22V10L16 3Z"/>
+  <path fill="none" stroke="#9ee6c2" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.65" d="M10 10v6l-4-3m4 1L7 8m15 2v6l4-3m-4 1 3-6M10 16c0 7 12 7 12 0m-8 5h4"/>
+</svg>`
+const FAVICON_LINK = `<link rel="icon" type="image/svg+xml" href="/favicon.svg">`
 
 function booleanOption(value: unknown, fallback: boolean) {
   if (typeof value === "boolean") return value
@@ -855,6 +860,7 @@ function landingHtml(sessions: SessionSummary[], templates: TemplateSummary[], s
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="referrer" content="no-referrer">
+  ${FAVICON_LINK}
   <title>Reindr</title>
   <style>
     :root { color-scheme: dark; background: #080808; color: #f4f4f5; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
@@ -922,6 +928,7 @@ function templatePreviewHtml(name: string, frameURL: string, nonce: string, temp
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+${FAVICON_LINK}
 <title>${escapeHTML(name)} | Reindr template preview</title>
 <style>
   :root { color-scheme: dark; background: #050505; color: #f4f4f5; font-family: Inter, ui-sans-serif, system-ui, sans-serif; }
@@ -972,6 +979,7 @@ function shellHtml(nonce: string) {
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
+${FAVICON_LINK}
 <title>reindr</title>
 <style>
   :root { --bg: #050505; --panel: #090909; --raised: #111; --hover: #171717; --edge: #242424; --ink: #f4f4f5; --muted: #7c7c82; --accent: #fafafa; --bad: #ff6259; color-scheme: dark; }
@@ -2287,9 +2295,18 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
             "referrer-policy": "no-referrer",
             "x-content-type-options": "nosniff",
             "x-frame-options": "DENY",
-            "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
+            "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
           },
         })
+        if (req.method === "GET" && url.pathname === "/favicon.svg") {
+          return new Response(FAVICON_SVG, {
+            headers: {
+              "content-type": "image/svg+xml; charset=utf-8",
+              "cache-control": "no-store",
+              "x-content-type-options": "nosniff",
+            },
+          })
+        }
         if (url.pathname === "/ws") {
           const requestedSession = url.searchParams.get("session")
           if (req.headers.get("origin") !== panelOrigin || url.searchParams.get("token") !== authToken || requestedSession && !canvases.has(requestedSession)) {
@@ -2362,7 +2379,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
               "referrer-policy": "no-referrer",
               "x-content-type-options": "nosniff",
               "x-frame-options": "DENY",
-              "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+              "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
             },
           })
         }
@@ -2380,7 +2397,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
             "referrer-policy": "no-referrer",
             "x-content-type-options": "nosniff",
             "x-frame-options": "DENY",
-            "content-security-policy": `default-src 'none'; script-src 'nonce-${shellNonce}'; style-src 'unsafe-inline'; connect-src 'self' ${connectSource}; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+            "content-security-policy": `default-src 'none'; script-src 'nonce-${shellNonce}'; style-src 'unsafe-inline'; img-src 'self'; connect-src 'self' ${connectSource}; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
           },
         })
       },

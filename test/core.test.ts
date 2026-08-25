@@ -94,9 +94,15 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   assert.equal(landing.status, 200)
   assert.equal(landing.headers.get("x-frame-options"), "DENY")
   assert.match(landing.headers.get("content-security-policy") ?? "", /default-src 'none'/)
+  assert.match(landing.headers.get("content-security-policy") ?? "", /img-src 'self'/)
   const landingDocument = await landing.text()
+  assert.match(landingDocument, /<link rel="icon" type="image\/svg\+xml" href="\/favicon\.svg">/)
   assert.match(landingDocument, /Reindr[\s\S]*Start a session to get started\./)
   assert.doesNotMatch(landingDocument, /Session session-a|Session session-b|token=/, "the unauthenticated landing page exposes no bearer links or session metadata")
+  const favicon = await fetch(new URL("/favicon.svg", panelURL))
+  assert.equal(favicon.status, 200)
+  assert.equal(favicon.headers.get("content-type"), "image/svg+xml; charset=utf-8")
+  assert.match(await favicon.text(), /<svg[\s\S]*#101513[\s\S]*#9ee6c2[\s\S]*<\/svg>/)
   const authorizedLandingURL = new URL("/", panelURL)
   authorizedLandingURL.search = panelURL.search
   authorizedLandingURL.searchParams.set("view", "sessions")
@@ -110,6 +116,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   assert.equal(templatePreview.status, 200)
   assert.match(templatePreview.headers.get("content-security-policy") ?? "", /frame-src 'self'/)
   const templatePreviewDocument = await templatePreview.text()
+  assert.match(templatePreviewDocument, /href="\/favicon\.svg"/)
   assert.match(templatePreviewDocument, /Read-only preview[\s\S]*Template preview: opencode-controller\.html/)
   const forbiddenTemplateFrame = await fetch(new URL("/template-frame/opencode-controller.html", panelURL))
   assert.equal(forbiddenTemplateFrame.status, 403)
@@ -146,6 +153,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   assert.equal(panel.status, 200)
   assert.equal(panel.headers.get("x-frame-options"), "DENY")
   assert.match(panel.headers.get("content-security-policy") ?? "", /frame-ancestors 'none'/)
+  assert.match(await panel.text(), /href="\/favicon\.svg"/)
 
   const websocketURL = new URL("/ws", panelURL)
   websocketURL.protocol = "ws:"
