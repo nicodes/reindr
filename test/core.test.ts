@@ -57,6 +57,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   const secondEnvironment = await sessionEnvironment(hooks, "session-b")
   assert.notEqual(secondEnvironment.OPENCODE_UI_FILE, firstEnvironment.OPENCODE_UI_FILE)
   assert.notEqual(secondEnvironment.OPENCODE_UI_URL, firstEnvironment.OPENCODE_UI_URL)
+  assert.equal(new URL(secondEnvironment.OPENCODE_UI_URL).search, new URL(firstEnvironment.OPENCODE_UI_URL).search)
   await writeFile(secondEnvironment.OPENCODE_UI_FILE, "<main>Other session</main>")
   await notifyFileEdit(hooks, "session-b")
 
@@ -74,7 +75,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   websocketURL.searchParams.set("session", "session-a")
   const socket = await openSocket(websocketURL.href, panelURL.origin)
   const init = await nextMessage(socket, (message) => message.type === "init")
-  assert.equal(init.canvases.length, 1, "a session capability cannot enumerate another session")
+  assert.equal(init.canvases.length, 2, "the project panel exposes every local session")
   const canvas = init.canvases.find((item: any) => item.sessionID === "session-a")
   assert.ok(canvas)
   const frameResponse = await fetch(new URL(canvas.frameURL, panelURL))
@@ -91,10 +92,10 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   crossSessionURL.protocol = "ws:"
   crossSessionURL.search = panelURL.search
   crossSessionURL.searchParams.set("session", "session-b")
-  const crossSessionResponse = await fetch(crossSessionURL.href.replace(/^ws:/, "http:"), {
-    headers: { origin: panelURL.origin },
-  })
-  assert.equal(crossSessionResponse.status, 403, "a session token cannot bind to another session")
+  const crossSessionSocket = await openSocket(crossSessionURL.href, panelURL.origin)
+  const crossSessionInit = await nextMessage(crossSessionSocket, (message) => message.type === "init")
+  assert.equal(crossSessionInit.canvases.length, 2, "the shared panel token can switch its active local session")
+  crossSessionSocket.close()
 
   const queuedPromise = nextMessage(socket, (message) => message.type === "submission-status" && message.status === "queued")
   socket.send(JSON.stringify({ type: "submit", prompt: "Apply settings", data: { dryRun: true } }))
@@ -114,4 +115,51 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   socket.close()
   await hooks.event?.({ event: { type: "session.deleted", properties: { info: { id: "session-b" } } } as never })
   await assert.rejects(access(secondEnvironment.OPENCODE_UI_FILE))
+})
+
+test("panel registry links sessions served by different plugin ports", async (t) => {
+  const restoreBun = installBunServeAdapter()
+  const canvasDirectory = await mkdtemp(path.join(process.cwd(), ".opencode", "test-ui-registry-"))
+  const firstPort = await freePort()
+  const firstFake = fakeClient("idle")
+  const secondFake = fakeClient("idle")
+  const pluginInput = (client: unknown) => ({
+    client: client as never,
+    project: { id: "registry-project" } as never,
+    directory: process.cwd(),
+    worktree: process.cwd(),
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    experimental_workspace: { register() {} },
+    $: undefined as never,
+  })
+  const firstHooks = await plugin(pluginInput(firstFake.client), { port: firstPort, autoOpen: false, canvasDirectory })
+  const secondPort = await freePort()
+  const secondHooks = await plugin(pluginInput(secondFake.client), { port: secondPort, autoOpen: false, canvasDirectory })
+
+  t.after(async () => {
+    await secondHooks.dispose?.()
+    await firstHooks.dispose?.()
+    restoreBun()
+    await rm(canvasDirectory, { recursive: true, force: true })
+  })
+
+  const firstEnvironment = await sessionEnvironment(firstHooks, "registry-a")
+  const secondEnvironment = await sessionEnvironment(secondHooks, "registry-b")
+  await writeFile(firstEnvironment.OPENCODE_UI_FILE, "<main>Registry A</main>")
+  await notifyFileEdit(firstHooks, "registry-a")
+  await writeFile(secondEnvironment.OPENCODE_UI_FILE, "<main>Registry B</main>")
+  await notifyFileEdit(secondHooks, "registry-b")
+  await new Promise((resolve) => setTimeout(resolve, 150))
+
+  const firstPanelURL = new URL(firstEnvironment.OPENCODE_UI_URL)
+  const socketURL = new URL("/ws", firstPanelURL)
+  socketURL.protocol = "ws:"
+  socketURL.search = firstPanelURL.search
+  socketURL.searchParams.set("session", "registry-a")
+  const socket = await openSocket(socketURL.href, firstPanelURL.origin)
+  const init = await nextMessage(socket, (message) => message.type === "init")
+  const origins = new Set(init.sessions.map((session: any) => new URL(session.url).origin))
+  assert.deepEqual(origins, new Set([new URL(firstEnvironment.OPENCODE_UI_URL).origin, new URL(secondEnvironment.OPENCODE_UI_URL).origin]))
+  assert.equal(init.sessions.length, 2)
+  socket.close()
 })

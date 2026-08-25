@@ -112,6 +112,7 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   await new Promise((resolve) => setTimeout(resolve, 500))
   assert.equal(fake.prompts.length, 0, "page-load and forged submissions are blocked")
   assert.equal(await page.locator(".card, .bar, .rail").count(), 0, "the shell adds no content chrome")
+  assert.equal(await page.locator("#status, #dot").count(), 0, "the header has no connection status chrome")
   const viewBounds = await page.locator(".agent-view").boundingBox()
   assert.equal(viewBounds?.x, 0)
   assert.equal(viewBounds?.width, 1000)
@@ -122,8 +123,11 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   await sessionToggle.click()
   const drawer = page.locator("#session-drawer")
   await drawer.waitFor()
-  assert.equal(await drawer.getByRole("link").count(), 1, "a session-scoped panel cannot enumerate another session")
-  await drawer.getByRole("button", { name: "Close sessions" }).click()
+  assert.equal(await drawer.getByRole("link").count(), 2, "the panel lists every project session")
+  assert.equal(await drawer.getByText("browser-session", { exact: true }).count(), 1)
+  assert.equal(await drawer.locator(".drawer-head, #drawer-close").count(), 0, "the drawer has no heading or close button")
+  await sessionToggle.click()
+  assert.equal(await sessionToggle.getAttribute("aria-expanded"), "false")
 
   const networkStatus = await frame.locator("#network").textContent()
   assert.equal(networkStatus, "network blocked", `UI page errors: ${pageErrors.join(" | ")} Console: ${consoleMessages.join(" | ")}`)
@@ -164,4 +168,66 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   const restoredFrame = restoredPage.frameLocator('iframe[title="Session browser-session"]')
   assert.equal(await restoredFrame.getByText("Updated summary").count(), 1)
   await restoredPage.close()
+})
+
+test("Chromium switches between plugin processes in one tab", async (t) => {
+  const restoreBun = installBunServeAdapter()
+  const canvasDirectory = await mkdtemp(path.join(process.cwd(), ".opencode", "test-ui-cross-port-"))
+  const firstFake = fakeClient("idle")
+  const secondFake = fakeClient("idle")
+  const pluginInput = (client: unknown) => ({
+    client: client as never,
+    project: { id: "cross-port-project" } as never,
+    directory: process.cwd(),
+    worktree: process.cwd(),
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    experimental_workspace: { register() {} },
+    $: undefined as never,
+  })
+  const firstPort = await freePort()
+  const firstHooks = await plugin(pluginInput(firstFake.client), { port: firstPort, autoOpen: false, canvasDirectory })
+  const secondPort = await freePort()
+  const secondHooks = await plugin(pluginInput(secondFake.client), { port: secondPort, autoOpen: false, canvasDirectory })
+  const browser = await chromium.launch({ executablePath: "/usr/bin/chromium", headless: true })
+
+  t.after(async () => {
+    await browser.close()
+    await secondHooks.dispose?.()
+    await firstHooks.dispose?.()
+    restoreBun()
+    await rm(canvasDirectory, { recursive: true, force: true })
+  })
+
+  const firstEnvironment = await sessionEnvironment(firstHooks, "cross-port-a")
+  const secondEnvironment = await sessionEnvironment(secondHooks, "cross-port-b")
+  const waitingPage = await browser.newPage()
+  const rootURL = new URL("/", firstEnvironment.OPENCODE_UI_URL)
+  rootURL.search = new URL(firstEnvironment.OPENCODE_UI_URL).search
+  await waitingPage.goto(rootURL.href)
+  await waitingPage.getByText("Waiting for a session UI file.").waitFor()
+  await writeFile(firstEnvironment.OPENCODE_UI_FILE, "<main>First process UI</main>")
+  await notifyFileEdit(firstHooks, "cross-port-a")
+  await waitingPage.waitForURL((url) => url.pathname === new URL(firstEnvironment.OPENCODE_UI_URL).pathname)
+  await waitingPage.close()
+  await writeFile(secondEnvironment.OPENCODE_UI_FILE, `<main>Second process UI <button id="send">Send</button></main><script>document.getElementById("send").addEventListener("click", function () { opencode.submit({ prompt: "Second process interaction" }); });</script>`)
+  await notifyFileEdit(secondHooks, "cross-port-b")
+
+  const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
+  await page.goto(firstEnvironment.OPENCODE_UI_URL)
+  await page.locator("#session-toggle").click()
+  const drawer = page.locator("#session-drawer")
+  await drawer.getByRole("link").nth(1).waitFor()
+  assert.equal(await drawer.getByRole("link").count(), 2)
+  await drawer.getByRole("link", { name: /Session cross-port-b/ }).click()
+  await page.waitForURL((url) => url.origin === new URL(secondEnvironment.OPENCODE_UI_URL).origin)
+  await page.locator('iframe[title="Session cross-port-b"]').waitFor({ state: "attached" })
+  const secondFrame = page.frameLocator('iframe[title="Session cross-port-b"]')
+  assert.equal(await secondFrame.getByText(/Second process UI/).count(), 1)
+  await secondFrame.getByRole("button", { name: "Send" }).click()
+  for (let attempt = 0; attempt < 100 && !secondFake.prompts.length; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  assert.equal(firstFake.prompts.length, 0)
+  assert.equal(secondFake.prompts.length, 1)
+  assert.match(secondFake.prompts[0].body.parts[0].text, /Second process interaction/)
 })
