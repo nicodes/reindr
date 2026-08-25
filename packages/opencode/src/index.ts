@@ -503,8 +503,6 @@ const BRIDGE_HTML = `<script>
   var stringify = JSON.stringify;
   var parse = JSON.parse;
   var hasOwn = Object.prototype.hasOwnProperty;
-  var activation = navigator.userActivation;
-  var getIsActive = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(activation), "isActive").get;
   var getIsTrusted = Object.getOwnPropertyDescriptor(new Event("reindr-bridge"), "isTrusted").get;
   var getMessageData = Object.getOwnPropertyDescriptor(MessageEvent.prototype, "data").get;
   var defer = setTimeout.bind(window);
@@ -519,10 +517,6 @@ const BRIDGE_HTML = `<script>
   function consumeActivation(name) {
     if (!activeEvent) {
       fail(name + " requires a user click or form submission.");
-      return false;
-    }
-    if (!activation || !apply(getIsActive, activation, [])) {
-      fail("The browser did not grant user activation.");
       return false;
     }
     activeEvent = null;
