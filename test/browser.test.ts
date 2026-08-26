@@ -122,6 +122,7 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   landingURL.searchParams.set("view", "sessions")
   await landingPage.goto(landingURL.href)
   await landingPage.getByRole("heading", { name: "Reindr" }).waitFor()
+  assert.equal(new URL(landingPage.url()).searchParams.has("token"), false, "the landing page removes its panel token from the address bar")
   assert.equal(await landingPage.getByText("Start a session to get started.").count(), 1)
   assert.equal(await landingPage.getByRole("navigation", { name: "Running Reindr sessions" }).getByRole("link").count(), 2)
   await landingPage.getByRole("tab", { name: "Templates" }).click()
@@ -144,6 +145,16 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   await landingPage.getByRole("heading", { name: "Reindr" }).waitFor()
   await landingPage.getByRole("link", { name: /Session browser-session/ }).click()
   await landingPage.locator('iframe[title="Session browser-session"]').waitFor({ state: "attached" })
+  const invalidPanelURL = new URL("/?view=sessions&token=invalid", panelURL)
+  await landingPage.goto(invalidPanelURL.href)
+  await landingPage.getByRole("navigation", { name: "Running Reindr sessions" }).getByRole("link").first().waitFor()
+  assert.equal(new URL(landingPage.url()).searchParams.has("token"), false, "a rejected token does not replace the valid refresh credential")
+  await landingPage.evaluate(() => sessionStorage.setItem("reindr:panel-token", "stale-token"))
+  const cleanSessionURL = new URL("/s/browser-session", panelURL)
+  await landingPage.goto(cleanSessionURL.href)
+  await landingPage.waitForFunction(() => sessionStorage.getItem("reindr:panel-token") === null)
+  await landingPage.getByRole("heading", { name: "Reindr" }).waitFor()
+  assert.equal(landingPage.url(), cleanSessionURL.href, "a stale stored token is rejected once without a navigation loop")
   await landingPage.close()
   const page = await browser.newPage({ viewport: { width: 1000, height: 800 } })
   const pageErrors: string[] = []
@@ -154,6 +165,10 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   await page.locator('iframe[title="Session browser-session"]').waitFor({ state: "attached", timeout: 5_000 }).catch(async (error) => {
     throw new Error(`${String(error)}\nPage errors: ${pageErrors.join(" | ")}\nBody: ${await page.locator("body").innerText()}`)
   })
+  assert.equal(new URL(page.url()).searchParams.has("token"), false, "the session shell removes its panel token from the address bar")
+  await page.reload()
+  await page.locator('iframe[title="Session browser-session"]').waitFor({ state: "attached", timeout: 5_000 })
+  assert.equal(new URL(page.url()).searchParams.has("token"), false, "a refreshed session recovers authentication without exposing its token")
   const frame = page.frameLocator('iframe[title="Session browser-session"]')
   await frame.getByText("OpenCode controller").waitFor()
   await writeFile(environment.REINDR_UI_FILE, canvasHTML("Original summary"))
@@ -210,6 +225,18 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   assert.equal(fake.prompts[0].path.id, "browser-session")
   assert.match(fake.prompts[0].body.parts[0].text, /Apply refactor options/)
   assert.match(fake.prompts[0].body.parts[0].text, /PreservedByReload/)
+
+  const storageBlockedPage = await browser.newPage()
+  await storageBlockedPage.addInitScript(() => {
+    Object.defineProperty(Storage.prototype, "setItem", {
+      configurable: true,
+      value() { throw new DOMException("Storage blocked", "SecurityError") },
+    })
+  })
+  await storageBlockedPage.goto(panelURL.href)
+  await storageBlockedPage.locator('iframe[title="Session browser-session"]').waitFor({ state: "attached" })
+  assert.equal(new URL(storageBlockedPage.url()).searchParams.has("token"), false, "URL cleanup does not depend on session storage")
+  await storageBlockedPage.close()
 
   await page.close()
   await hooks.dispose?.()
@@ -366,6 +393,7 @@ test("Chromium switches between plugin processes in one tab", async (t) => {
 
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
   await page.goto(firstEnvironment.REINDR_UI_URL)
+  assert.equal(new URL(page.url()).searchParams.has("token"), false)
   await page.locator("#session-toggle").click()
   const drawer = page.locator("#session-drawer")
   assert.equal(await drawer.getByRole("link").count(), 1)
@@ -378,6 +406,10 @@ test("Chromium switches between plugin processes in one tab", async (t) => {
   await drawer.getByRole("link", { name: /Session cross-port-b/ }).click()
   await page.waitForURL((url) => url.origin === new URL(secondEnvironment.REINDR_UI_URL).origin)
   await page.locator('iframe[title="Session cross-port-b"]').waitFor({ state: "attached" })
+  assert.equal(new URL(page.url()).searchParams.has("token"), false, "cross-port navigation cleans the destination token")
+  await page.reload()
+  await page.locator('iframe[title="Session cross-port-b"]').waitFor({ state: "attached" })
+  assert.equal(new URL(page.url()).searchParams.has("token"), false, "cross-port refresh recovers the destination token")
   const secondFrame = page.frameLocator('iframe[title="Session cross-port-b"]')
   assert.equal(await secondFrame.getByText(/Second process UI/).count(), 1)
   await secondFrame.getByRole("button", { name: "Send" }).click()
@@ -392,6 +424,7 @@ test("Chromium switches between plugin processes in one tab", async (t) => {
   await page.locator("#session-drawer").getByRole("link", { name: /Session cross-port-a/ }).click()
   await page.waitForURL((url) => url.origin === new URL(firstEnvironment.REINDR_UI_URL).origin)
   await page.locator('iframe[title="Session cross-port-a"]').waitFor({ state: "attached" })
+  assert.equal(new URL(page.url()).searchParams.has("token"), false, "return navigation cleans the original process token")
   await page.locator("#session-toggle").click()
   const firstDrawer = page.locator("#session-drawer")
   await firstDrawer.getByRole("link").nth(1).waitFor()
