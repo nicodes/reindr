@@ -110,11 +110,43 @@ const REGISTRY_STALE_MS = 10_000
 const BUILT_IN_TAILWIND_STYLESHEET = new URL("../assets/reindr-tailwind.css", import.meta.url)
 const BUILT_IN_LOADING_TEMPLATE = new URL("../assets/reindr-loading.html", import.meta.url)
 const BUILT_IN_CONTROLLER_TEMPLATE = new URL("../assets/opencode-controller.html", import.meta.url)
+const PANEL_TOKEN_STORAGE_KEY = "reindr:panel-token"
 const FAVICON_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
   <path fill="#101513" d="M16 3 28 10v12L16 29 4 22V10L16 3Z"/>
   <path fill="none" stroke="#9ee6c2" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.65" d="M10 10v6l-4-3m4 1L7 8m15 2v6l4-3m-4 1 3-6M10 16c0 7 12 7 12 0m-8 5h4"/>
 </svg>`
 const FAVICON_LINK = `<link rel="icon" type="image/svg+xml" href="/favicon.svg">`
+const panelTokenClientScript = (acceptQueryToken = true) => `
+  var tokenStorageKey = ${JSON.stringify(PANEL_TOKEN_STORAGE_KEY)};
+  var tokenParams = new URLSearchParams(location.search);
+  var token = tokenParams.get("token") || "";
+  var rejectedToken = "";
+  function cleanPanelURL() {
+    tokenParams.delete("token");
+    var cleanSearch = tokenParams.toString();
+    try { history.replaceState(history.state, "", location.pathname + (cleanSearch ? "?" + cleanSearch : "") + location.hash); } catch (_) {}
+  }
+  if (token && !${acceptQueryToken}) {
+    rejectedToken = token;
+    cleanPanelURL();
+    token = "";
+  }
+  if (token) {
+    try { sessionStorage.setItem(tokenStorageKey, token); } catch (_) {}
+    cleanPanelURL();
+  } else {
+    try {
+      token = sessionStorage.getItem(tokenStorageKey) || "";
+      if (rejectedToken && token === rejectedToken) {
+        sessionStorage.removeItem(tokenStorageKey);
+        token = "";
+      }
+    } catch (_) {}
+    if (token) {
+      tokenParams.set("token", token);
+      try { location.replace(location.pathname + "?" + tokenParams.toString() + location.hash); } catch (_) {}
+    }
+  }`
 
 function randomToken(bytes = 24) {
   return randomBytes(bytes).toString("base64url")
@@ -725,7 +757,7 @@ function canvasDocument(html: string, sharedCSS: string, allowedAssetOrigins: st
   return `<!doctype html><html class="${escapeHTML(parts.htmlClass)}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><meta name="referrer" content="no-referrer">${bridge}<style id="reindr-default-styles">${safeStyle(DEFAULT_SHARED_CSS)}</style><style id="reindr-shared-styles">${safeStyle(sharedCSS)}</style>${parts.head}</head><body class="${escapeHTML(parts.bodyClass)}">${parts.body}</body></html>`
 }
 
-function landingHtml(sessions: SessionSummary[], templates: TemplateSummary[], selectedView: "sessions" | "templates", token: string | null) {
+function landingHtml(sessions: SessionSummary[], templates: TemplateSummary[], selectedView: "sessions" | "templates", token: string | null, nonce: string) {
   const sessionLinks = sessions.map((session) => `
       <a class="session" href="${escapeHTML(session.url)}">
         <strong>${escapeHTML(session.title)}</strong>
@@ -792,6 +824,7 @@ function landingHtml(sessions: SessionSummary[], templates: TemplateSummary[], s
       <p>Start a session to get started.</p>
     </div>
   </main>
+  <script nonce="${nonce}">(function () {${panelTokenClientScript(token !== null)}})();</script>
 </body>
 </html>`
 }
@@ -831,6 +864,7 @@ ${FAVICON_LINK}
 <header><a href="${escapeHTML(templatesURL)}">Back to templates</a><h1>${escapeHTML(name)}</h1><span>Read-only preview</span></header>
 <iframe id="preview" title="Template preview: ${escapeHTML(name)}" sandbox="allow-scripts"></iframe>
 <script nonce="${nonce}">
+  ${panelTokenClientScript()}
   const frame = document.getElementById("preview");
   const snapshot = ${previewSnapshot};
   window.addEventListener("message", (event) => {
@@ -921,7 +955,7 @@ ${FAVICON_LINK}
 <div id="toast" role="status" aria-live="polite"></div>
 <script nonce="${nonce}">
 (function () {
-  var token = new URLSearchParams(location.search).get("token") || "";
+  ${panelTokenClientScript()}
   var match = location.pathname.match(/^\\/s\\/([^/]+)$/);
   var currentSession = match ? decodeURIComponent(match[1]) : null;
   var canvases = {};
@@ -2165,24 +2199,28 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       async fetch(req: Request, server: { upgrade(request: Request, options: { data: SocketData }): boolean }) {
         const url = new URL(req.url)
         if (panelOrigin && url.origin !== panelOrigin) return new Response("forbidden", { status: 403 })
-        const landing = async (authorized = false) => new Response(landingHtml(
-          authorized ? sessionsForClient() : [],
-          authorized ? (await listTemplates()).map((name) => ({
-            name,
-            url: `/template/${encodeURIComponent(name)}?token=${encodeURIComponent(authToken)}`,
-          })) : [],
-          url.searchParams.get("view") === "templates" ? "templates" : "sessions",
-          authorized ? authToken : null,
-        ), {
-          headers: {
-            "content-type": "text/html; charset=utf-8",
-            "cache-control": "no-store",
-            "referrer-policy": "no-referrer",
-            "x-content-type-options": "nosniff",
-            "x-frame-options": "DENY",
-            "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
-          },
-        })
+        const landing = async (authorized = false) => {
+          const nonce = randomToken(18)
+          return new Response(landingHtml(
+            authorized ? sessionsForClient() : [],
+            authorized ? (await listTemplates()).map((name) => ({
+              name,
+              url: `/template/${encodeURIComponent(name)}?token=${encodeURIComponent(authToken)}`,
+            })) : [],
+            url.searchParams.get("view") === "templates" ? "templates" : "sessions",
+            authorized ? authToken : null,
+            nonce,
+          ), {
+            headers: {
+              "content-type": "text/html; charset=utf-8",
+              "cache-control": "no-store",
+              "referrer-policy": "no-referrer",
+              "x-content-type-options": "nosniff",
+              "x-frame-options": "DENY",
+              "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; img-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'`,
+            },
+          })
+        }
         if (req.method === "GET" && url.pathname === "/favicon.svg") {
           return new Response(FAVICON_SVG, {
             headers: {
