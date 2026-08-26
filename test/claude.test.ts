@@ -97,6 +97,10 @@ test("Claude MCP opens a sandboxed panel and receives only trusted interactions"
   await page.goto(details.panelUrl)
   const frame = page.frameLocator("iframe")
   await assert.doesNotReject(() => frame.locator("body[data-synthetic-blocked=true]").waitFor())
+  assert.equal(new URL(page.url()).searchParams.has("token"), false, "the Claude panel removes its token from the address bar")
+  await page.reload()
+  await assert.doesNotReject(() => frame.locator("body[data-synthetic-blocked=true]").waitFor())
+  assert.equal(new URL(page.url()).searchParams.has("token"), false, "a refreshed Claude panel recovers authentication without exposing its token")
 
   const interaction = request("tools/call", { name: "reindr_wait", arguments: { timeoutSeconds: 10 } })
   const submitted = page.waitForRequest(request => new URL(request.url()).pathname === "/interaction", { timeout: 2_000 })

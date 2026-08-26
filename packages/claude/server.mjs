@@ -30,6 +30,26 @@ const uiFile = path.join(config.canvasDirectory, canvasFileName(sessionId))
 const queueFile = path.join(dataDirectory, "interactions.jsonl")
 const loadingTemplateFile = path.join(pluginRoot, "assets", "reindr-loading.html")
 const stylesheetFile = path.join(pluginRoot, "assets", "reindr-tailwind.css")
+const PANEL_TOKEN_STORAGE_KEY = "reindr:panel-token"
+const PANEL_TOKEN_CLIENT_SCRIPT = `
+  var tokenStorageKey = ${JSON.stringify(PANEL_TOKEN_STORAGE_KEY)};
+  var tokenParams = new URLSearchParams(location.search);
+  var token = tokenParams.get("token") || "";
+  function cleanPanelURL() {
+    tokenParams.delete("token");
+    var cleanSearch = tokenParams.toString();
+    try { history.replaceState(history.state, "", location.pathname + (cleanSearch ? "?" + cleanSearch : "") + location.hash); } catch (_) {}
+  }
+  if (token) {
+    try { sessionStorage.setItem(tokenStorageKey, token); } catch (_) {}
+    cleanPanelURL();
+  } else {
+    try { token = sessionStorage.getItem(tokenStorageKey) || ""; } catch (_) {}
+    if (token) {
+      tokenParams.set("token", token);
+      try { location.replace(location.pathname + "?" + tokenParams.toString() + location.hash); } catch (_) {}
+    }
+  }`
 
 let panelUrl = ""
 let openedBrowser = false
@@ -112,7 +132,13 @@ function shellDocument() {
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reindr - ${escapeHtml(sessionTitle)}</title>
 <style>html,body,iframe{width:100%;height:100%;margin:0;border:0}body{overflow:hidden;background:#080808}iframe{display:block}</style></head>
 <body><iframe id="ui" title="${escapeHtml(sessionTitle)} interface" sandbox="allow-scripts allow-forms" src="${framePath}"></iframe>
-<script nonce="${nonce}">(()=>{const frame=document.querySelector("#ui");let version="";function connect(){const channel=new MessageChannel();channel.port1.onmessage=event=>{if(event.data?.type!=="submit")return;fetch("/interaction?token=${panelToken}",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(event.data.value)}).catch(()=>{})};frame.contentWindow.postMessage("reindr:init","*",[channel.port2])}frame.addEventListener("load",connect);connect();setInterval(async()=>{try{const response=await fetch("/state?token=${panelToken}",{cache:"no-store"});if(!response.ok)return;const next=(await response.json()).version;if(version&&next!==version)frame.src="${framePath}&v="+encodeURIComponent(next);version=next}catch{}},500)})();</script></body></html>`
+<script nonce="${nonce}">(()=>{${PANEL_TOKEN_CLIENT_SCRIPT}const frame=document.querySelector("#ui");let version="";function connect(){const channel=new MessageChannel();channel.port1.onmessage=event=>{if(event.data?.type!=="submit")return;fetch("/interaction?token=${panelToken}",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify(event.data.value)}).catch(()=>{})};frame.contentWindow.postMessage("reindr:init","*",[channel.port2])}frame.addEventListener("load",connect);connect();setInterval(async()=>{try{const response=await fetch("/state?token=${panelToken}",{cache:"no-store"});if(!response.ok)return;const next=(await response.json()).version;if(version&&next!==version)frame.src="${framePath}&v="+encodeURIComponent(next);version=next}catch{}},500)})();</script></body></html>`
+  return { html, nonce }
+}
+
+function recoveryDocument() {
+  const nonce = randomBytes(18).toString("base64url")
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Reindr</title></head><body><p>Not found</p><script nonce="${nonce}">(()=>{${PANEL_TOKEN_CLIENT_SCRIPT}})();</script></body></html>`
   return { html, nonce }
 }
 
@@ -178,6 +204,14 @@ const httpServer = createServer(async (request, response) => {
       sendResponse(response, 200, html, {
         "content-type": "text/html; charset=utf-8",
         "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; style-src 'unsafe-inline'; frame-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
+      })
+      return
+    }
+    if (request.method === "GET" && url.pathname === "/" && !url.searchParams.has("token")) {
+      const { html, nonce } = recoveryDocument()
+      sendResponse(response, 404, html, {
+        "content-type": "text/html; charset=utf-8",
+        "content-security-policy": `default-src 'none'; script-src 'nonce-${nonce}'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'`,
       })
       return
     }
