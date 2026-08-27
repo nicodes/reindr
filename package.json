@@ -22,6 +22,7 @@
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",
+    "daisyui": "^5.7.22",
     "@modelcontextprotocol/sdk": "1.30.0",
     "@types/node": "^24.0.0",
     "@types/ws": "^8.18.1",

@@ -97,7 +97,6 @@ type RuntimePermission = {
 
 const MAX_CANVAS_HTML_BYTES = 1_000_000
 const MAX_TEMPLATE_BYTES = 200_000
-const MAX_STYLESHEET_BYTES = 200_000
 const MAX_DATA_BYTES = 64_000
 const MAX_CONTROLLER_RESPONSE_BYTES = 1_000_000
 const MAX_CONTROLLER_HISTORY_BYTES = 650_000
@@ -171,6 +170,17 @@ async function readBoundedFile(file: string | URL, maximumBytes: number, label: 
   const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
   try {
     return await readBoundedHandle(handle, maximumBytes, label)
+  } finally {
+    await handle.close()
+  }
+}
+
+async function readStylesheetFile(file: string | URL, label: string) {
+  const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
+  try {
+    const info = await handle.stat()
+    if (!info.isFile()) throw new Error(`${label} must be a regular file`)
+    return await handle.readFile("utf8")
   } finally {
     await handle.close()
   }
@@ -1621,14 +1631,14 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   const loadSharedStyles = async () => {
     const styles: string[] = []
     try {
-      styles.push(await readBoundedFile(BUILT_IN_TAILWIND_STYLESHEET, MAX_STYLESHEET_BYTES, "built-in Tailwind stylesheet"))
+      styles.push(await readStylesheetFile(BUILT_IN_TAILWIND_STYLESHEET, "built-in Tailwind stylesheet"))
     } catch (error) {
       log("warn", "failed to load built-in Tailwind stylesheet", { error: String(error) })
     }
     if (config.stylesheetPath) {
       const file = resolveFile(worktree, config.stylesheetPath)
       try {
-        styles.push(await readBoundedFile(file, MAX_STYLESHEET_BYTES, "stylesheet"))
+        styles.push(await readStylesheetFile(file, "stylesheet"))
         log("info", "loaded shared UI stylesheet", { file })
       } catch (error) {
         log("warn", "failed to load shared UI stylesheet", { file, error: String(error) })
@@ -2374,6 +2384,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       url ? `Panel: ${url}` : `Panel unavailable: ${serveError ?? "server did not start"}`,
       "When the user requests an interface, call reindr_open as your first action so the default OpenCode controller appears immediately, then edit the returned file with normal filesystem tools when a custom interface is needed. The reindr_open tool never overwrites existing content and is only a lifecycle tool; do not look for other UI rendering tools.",
       "Keep the file's HTML, CSS, and JavaScript self-contained. The plugin detects changes and live-reloads the sandboxed panel.",
+      "The frame already includes Tailwind CSS 4 utilities from the shipped templates plus daisyUI component classes such as btn, card, modal, navbar, drawer, and table. Prefer those classes over inlining a component library.",
       "Generated JavaScript may call opencode.submit({ prompt, data? }) directly from a user click or form submission. The optional data value must be JSON-serializable. Use opencode.setHeight(px) only when automatic sizing is insufficient.",
       config.allowedAssetOrigins.length
         ? `Static assets may load only from: ${config.allowedAssetOrigins.join(", ")}. Fetch, WebSocket, and form submission remain blocked.`
