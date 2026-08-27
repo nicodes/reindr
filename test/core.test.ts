@@ -63,6 +63,7 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   await hooks["experimental.chat.system.transform"]?.({ sessionID: "session-a", model: {} as never }, system)
   const firstEnvironment = await sessionEnvironment(hooks, "session-a")
   assert.match(system.system.join("\n"), new RegExp(firstEnvironment.REINDR_UI_FILE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+  assert.match(system.system.join("\n"), /daisyUI component classes/)
   assert.ok(firstEnvironment.REINDR_UI_URL)
 
   await hooks["chat.message"]?.(
@@ -174,6 +175,8 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
   const frameDocument = await frameResponse.text()
   assert.match(frameDocument, /opencode/)
   assert.match(frameDocument, /tailwindcss v4/)
+  assert.match(frameDocument, /\.btn\{/)
+  assert.match(frameDocument, /btn-primary/)
   assert.match(frameDocument, /MessageChannel|Content-Security-Policy/)
   assert.match(frameDocument, /<button>Apply<\/button>/)
   assert.match(frameDocument, /--ui-accent/)
@@ -386,5 +389,47 @@ test("panel registry links sessions served by different plugin ports", async (t)
   const origins = new Set(init.sessions.map((session: any) => new URL(session.url).origin))
   assert.deepEqual(origins, new Set([new URL(firstEnvironment.REINDR_UI_URL).origin, new URL(secondEnvironment.REINDR_UI_URL).origin]))
   assert.equal(init.sessions.length, 2)
+  socket.close()
+})
+
+test("shared stylesheets larger than 200 KB are injected", async (t) => {
+  const restoreBun = installBunServeAdapter()
+  const workspace = await mkdtemp(path.join(tmpdir(), "reindr-large-css-"))
+  const canvasDirectory = await mkdtemp(path.join(process.cwd(), ".opencode", "test-ui-large-css-"))
+  const templateDirectory = path.join(canvasDirectory, "templates")
+  const stylesheetPath = path.join(workspace, "shared.css")
+  await writeFile(stylesheetPath, `:root { --reindr-large-stylesheet: loaded; }\n${"/* pad */\n".repeat(25_000)}`)
+  const hooks = await plugin({
+    client: fakeClient("idle").client as never,
+    project: { id: "large-css-project" } as never,
+    directory: process.cwd(),
+    worktree: process.cwd(),
+    serverUrl: new URL("http://127.0.0.1:4096"),
+    experimental_workspace: { register() {} },
+    $: undefined as never,
+  }, { port: await freePort(), autoOpen: false, canvasDirectory, templateDirectory, stylesheetPath })
+
+  t.after(async () => {
+    await hooks.dispose?.()
+    restoreBun()
+    await rm(canvasDirectory, { recursive: true, force: true })
+    await rm(workspace, { recursive: true, force: true })
+  })
+
+  const environment = await sessionEnvironment(hooks, "large-css-session")
+  await writeFile(environment.REINDR_UI_FILE, "<main>Large stylesheet</main>")
+  await notifyFileEdit(hooks, "large-css-session")
+  const panelURL = new URL(environment.REINDR_UI_URL)
+  const websocketURL = new URL("/ws", panelURL)
+  websocketURL.protocol = "ws:"
+  websocketURL.search = panelURL.search
+  websocketURL.searchParams.set("session", "large-css-session")
+  const socket = await openSocket(websocketURL.href, panelURL.origin)
+  const init = await nextMessage(socket, (message) => message.type === "init")
+  const canvas = init.canvases.find((item: { sessionID: string }) => item.sessionID === "large-css-session")
+  assert.ok(canvas)
+  const frameDocument = await (await fetch(new URL(canvas.frameURL, panelURL))).text()
+  assert.match(frameDocument, /--reindr-large-stylesheet:\s*loaded/)
+  assert.ok(Buffer.byteLength(await readFile(stylesheetPath), "utf8") > 200_000)
   socket.close()
 })

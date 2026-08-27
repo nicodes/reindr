@@ -44,6 +44,7 @@ function canvasHTML(summary: string) {
       <body>
         <main id="app">
           <form id="form"><label>Name <input name="name" value="CanvasAPI"></label><button>Submit</button></form>
+          <button class="btn btn-primary" id="daisy-btn" type="button">Daisy</button>
           <aside id="summary">${summary}</aside>
           <div id="network">checking network</div>
         </main>
@@ -199,6 +200,12 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   assert.equal(networkStatus, "network blocked", `UI page errors: ${pageErrors.join(" | ")} Console: ${consoleMessages.join(" | ")}`)
   assert.equal(await frame.locator("#app").count(), 1)
   assert.equal(await frame.locator(":root").evaluate((element) => getComputedStyle(element).getPropertyValue("--test-shared-style").trim()), "loaded")
+  const daisyStyle = await frame.locator("#daisy-btn").evaluate((element) => {
+    const style = getComputedStyle(element)
+    return { background: style.backgroundColor, height: style.height }
+  })
+  assert.notEqual(daisyStyle.background, "rgba(0, 0, 0, 0)", JSON.stringify(daisyStyle))
+  assert.notEqual(daisyStyle.background, "rgb(239, 239, 239)", JSON.stringify(daisyStyle))
 
   const nameInput = frame.locator('input[name="name"]')
   await nameInput.fill("PreservedByReload")

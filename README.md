@@ -127,7 +127,7 @@ Existing files are rediscovered when their session becomes active after an OpenC
 
 Panel registry records heartbeat while their OpenCode process is running. Records that stop updating expire automatically, removing crashed or closed processes from navigation.
 
-Each UI file is limited to 1 MB of UTF-8 HTML. Loading templates and the optional shared stylesheet are each limited to 200 KB.
+Each UI file is limited to 1 MB of UTF-8 HTML. Loading templates is limited to 200 KB. Built-in and optional shared stylesheets are not size-capped.
 
 ## Saved Templates
 
@@ -148,14 +148,14 @@ OpenCode 1.18.22 does not expose a public v1 API for persistent session agent/mo
 
 ## Tailwind And Shared Styling
 
-The shipped templates use Tailwind CSS 4 utilities without a browser runtime or CDN dependency. `npm run build:opencode` scans the adapter source and `packages/opencode/assets/*.html`, then writes the minified, content-scoped stylesheet to `packages/opencode/assets/reindr-tailwind.css`. Reindr embeds that generated stylesheet in each sandboxed frame.
+The shipped templates use Tailwind CSS 4 utilities and daisyUI component classes without a browser runtime or CDN dependency. `npm run build:opencode` compiles daisyUI (dark default, light available) plus utilities scanned from the adapter source and `packages/opencode/assets/*.html`, then writes the minified stylesheet to `packages/opencode/assets/reindr-tailwind.css`. Reindr embeds that generated stylesheet in each sandboxed frame. Session HTML can use classes such as `btn`, `card`, and `modal` without inlining a component library. Tailwind layout utilities are still limited to classes present in those scanned sources.
 
 The generated document also receives a small neutral base stylesheet before Tailwind. It supplies dark defaults and reusable tokens such as `--ui-bg`, `--ui-surface`, `--ui-text`, and `--ui-accent` for session HTML that does not use utilities.
 
 An optional local shared stylesheet can be configured by the user. Styles are applied in this order:
 
 1. Built-in neutral defaults and design tokens.
-2. Built-in compiled Tailwind utilities.
+2. Built-in compiled Tailwind utilities and daisyUI.
 3. The configured shared stylesheet.
 4. Styles from the session HTML file.
 
@@ -211,7 +211,7 @@ Environment variables override plugin options.
 - The trusted bridge communicates over a private `MessageChannel`; arbitrary generated scripts cannot forge privileged shell messages with `parent.postMessage`.
 - `opencode.submit()` is accepted only synchronously inside a trusted click or form-submission event.
 - Controller RPC is available only while the canvas bytes exactly match the shipped controller. Prompts, commands, and aborts are accepted by the bridge only synchronously inside a trusted click or form-submission event and are restricted to the owning session.
-- Interaction payloads, pending interactions, controller snapshots, open preview capabilities, and file reads are bounded. Session dispatch is serialized so commands cannot race queued prompts.
+- Interaction payloads, pending interactions, controller snapshots, open preview capabilities, UI files, and templates are bounded. Stylesheets are not size-capped. Session dispatch is serialized so commands cannot race queued prompts.
 
 Allowlisted hosts are trusted code suppliers. A script loaded from an allowed host runs inside the generated-content sandbox and can influence what the interface displays or submits after a user action.
 
