@@ -48,6 +48,8 @@ To avoid approving external-directory access to Reindr's default data directory 
 
 Preserve your existing plugin list, settings, and permission rules; merge the entry into the existing `permission.external_directory` object rather than replacing your configuration. If `external_directory` is a single `"ask"` or `"deny"` value, preserve it as the object's first `"*"` rule, then add the Reindr exception. The **last matching rule wins**, so put this exception after any broad `"*": "ask"` or `"*": "deny"` rule. OpenCode expands `~` to your home directory. Project and agent overrides can still take precedence over global permissions.
 
+If you already have `"external_directory": "allow"`, it grants broader external access and needs no Reindr exception. Do not replace it with this scoped object unless you intentionally want to narrow that existing access.
+
 Quit and restart OpenCode after saving. The approval UI's **always** option applies only for the rest of the current OpenCode session; it does not save this persistent configuration.
 
 This allows the external-directory boundary check for reads and writes under `~/.local/share/reindr`, not unrestricted tool use. Normal `read`, `edit`, and other tool permissions still apply; `edit` covers `edit`, `write`, and `patch`. If those permissions ask or deny, this snippet does not override them. Do not use a global `"*": "allow"` to solve this prompt.
