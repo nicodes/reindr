@@ -31,6 +31,33 @@ OpenCode installs the package and its `@nicodes/reindr-core` dependency automati
 
 For repository development, the tracked `.opencode/plugins/reindr.ts` shim loads `packages/opencode/src/index.ts` directly after `bun install` and `bun run build:core`.
 
+### Persistent Access To Reindr Files
+
+To avoid approving external-directory access to Reindr's default data directory in every session, merge this snippet into your project-root `opencode.json`, or into `~/.config/opencode/opencode.json` for all projects:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permission": {
+    "external_directory": {
+      "~/.local/share/reindr/**": "allow"
+    }
+  }
+}
+```
+
+Preserve your existing plugin list, settings, and permission rules; merge the entry into the existing `permission.external_directory` object rather than replacing your configuration. If `external_directory` is a single `"ask"` or `"deny"` value, preserve it as the object's first `"*"` rule, then add the Reindr exception. The **last matching rule wins**, so put this exception after any broad `"*": "ask"` or `"*": "deny"` rule. OpenCode expands `~` to your home directory. Project and agent overrides can still take precedence over global permissions.
+
+If you already have `"external_directory": "allow"`, it grants broader external access and needs no Reindr exception. Do not replace it with this scoped object unless you intentionally want to narrow that existing access.
+
+Quit and restart OpenCode after saving. The approval UI's **always** option applies only for the rest of the current OpenCode session; it does not save this persistent configuration.
+
+This allows the external-directory boundary check for reads and writes under `~/.local/share/reindr`, not unrestricted tool use. Normal `read`, `edit`, and other tool permissions still apply; `edit` covers `edit`, `write`, and `patch`. If those permissions ask or deny, this snippet does not override them. Do not use a global `"*": "allow"` to solve this prompt.
+
+Only enable this for a trusted directory: unlike Reindr's automatic session-HTML permission, this opt-in rule covers the entire data tree, including saved templates and process registry credentials. If you use `XDG_DATA_HOME`, `REINDR_DIRECTORY`, or `REINDR_TEMPLATE_DIRECTORY` to store files elsewhere, use explicit patterns for the actual trusted paths instead; the default pattern does not cover those locations.
+
+See the [OpenCode permissions documentation](https://opencode.ai/docs/permissions/) for external directories, rule ordering, and tool permissions.
+
 ## Install For Claude Code
 
 Add the repository marketplace and install its Reindr plugin:
