@@ -1,7 +1,7 @@
 import { homedir } from "node:os"
 import path from "node:path"
 
-export const REINDR_DEFAULT_PORT = 4917
+export const REINDR_DEFAULT_PORT = 7676
 
 export interface ReindrOptions {
   port?: number
@@ -15,6 +15,7 @@ export interface ReindrOptions {
 
 export interface ReindrConfig {
   preferredPort: number
+  portExplicit: boolean
   autoOpen: boolean
   browserCommand: string | null
   canvasDirectory: string
@@ -78,8 +79,10 @@ export function resolveReindrConfig(
     : typeof options.templateDirectory === "string"
       ? options.templateDirectory
       : path.join(path.dirname(canvasDirectory), "templates")
+  const configuredPort = portOption(environment.REINDR_PORT ?? options.port, NaN)
   return {
-    preferredPort: portOption(environment.REINDR_PORT ?? options.port, REINDR_DEFAULT_PORT),
+    preferredPort: Number.isNaN(configuredPort) ? REINDR_DEFAULT_PORT : configuredPort,
+    portExplicit: !Number.isNaN(configuredPort),
     autoOpen: booleanOption(environment.REINDR_AUTORAISE ?? options.autoOpen, true),
     browserCommand:
       typeof environment.REINDR_BROWSER === "string"

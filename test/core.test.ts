@@ -35,6 +35,61 @@ async function openReindr(hooks: Awaited<ReturnType<typeof plugin>>, sessionID: 
   })
 }
 
+test("OpenCode retries only default occupied ports, sequentially and without wrapping", async t => {
+  const originalBun = (globalThis as { Bun?: unknown }).Bun
+  const originalPort = process.env.REINDR_PORT
+  t.after(() => {
+    ;(globalThis as { Bun?: unknown }).Bun = originalBun
+    if (originalPort === undefined) delete process.env.REINDR_PORT
+    else process.env.REINDR_PORT = originalPort
+  })
+  const cases = [
+    { name: "default free", attempts: [7676], failures: 0 },
+    { name: "default occupied twice", attempts: [7676, 7677, 7678], failures: 2 },
+    { name: "explicit default", port: 7676, attempts: [7676], failures: 1, error: /port 7676 is already in use/ },
+    { name: "explicit custom", port: 8123, attempts: [8123], failures: 1, error: /port 8123 is already in use/ },
+    { name: "environment explicit", env: "7676", attempts: [7676], failures: 1, error: /explicit ports are never retried/ },
+    { name: "invalid environment", env: "invalid", attempts: [7676, 7677], failures: 1 },
+    { name: "unrelated error", code: "EACCES", attempts: [7676], failures: 1, error: /EACCES/ },
+    { name: "unrelated error after occupancy", attempts: [7676, 7677], failures: 2, lastCode: "EACCES", error: /EACCES/ },
+    { name: "OS assigned", port: 0, attempts: [0], failures: 0 },
+    { name: "zero never retries", port: 0, attempts: [0], failures: 1, error: /explicit ports are never retried/ },
+    { name: "exhaustion", attempts: Array.from({ length: 65535 - 7676 + 1 }, (_, i) => 7676 + i), failures: Infinity, error: /no free port remains through 65535/ },
+  ]
+  for (const scenario of cases) await t.test(scenario.name, async t => {
+    if (scenario.env === undefined) delete process.env.REINDR_PORT
+    else process.env.REINDR_PORT = scenario.env
+    const attempts: number[] = []
+    const occupied = Object.assign(new Error(scenario.code ?? "EADDRINUSE"), { code: scenario.code ?? "EADDRINUSE" })
+    ;(globalThis as { Bun?: unknown }).Bun = {
+      serve({ port }: { port: number }) {
+        attempts.push(port)
+        if (scenario.lastCode && attempts.length === scenario.failures) {
+          throw Object.assign(new Error(scenario.lastCode), { code: scenario.lastCode })
+        }
+        if (attempts.length <= scenario.failures) throw occupied
+        return { port: port || 43210, stop() {} }
+      },
+    }
+    const canvasDirectory = await mkdtemp(path.join(tmpdir(), "reindr-port-test-"))
+    t.after(() => rm(canvasDirectory, { recursive: true, force: true }))
+    const hooks = await plugin({
+      client: fakeClient("idle").client as never,
+      project: { id: "port-test" } as never,
+      directory: process.cwd(), worktree: process.cwd(),
+      serverUrl: new URL("http://127.0.0.1:4096"),
+      experimental_workspace: { register() {} }, $: undefined as never,
+    }, { port: scenario.port, autoOpen: false, canvasDirectory })
+    t.after(() => hooks.dispose?.())
+    assert.deepEqual(attempts, scenario.attempts)
+    const result = await openReindr(hooks, "port-test")
+    assert.equal(typeof result, "object")
+    const output = (result as { output: string }).output
+    if (scenario.error) assert.match(output, scenario.error)
+    else assert.match(output, new RegExp(`Panel: http://127\\.0\\.0\\.1:${attempts.at(-1) || 43210}/`))
+  })
+})
+
 test("file-backed session routing, interaction delivery, and HTTP security", async (t) => {
   const restoreBun = installBunServeAdapter()
   const canvasDirectory = await mkdtemp(path.join(process.cwd(), ".opencode", "test-ui-core-"))
