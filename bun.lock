@@ -19,11 +19,11 @@
     },
     "packages/claude": {
       "name": "@nicodes/reindr-claude-workspace",
-      "version": "0.0.1",
+      "version": "0.0.2",
     },
     "packages/core": {
       "name": "@nicodes/reindr-core",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "devDependencies": {
         "@types/node": "^24.0.0",
         "typescript": "^5.9.0",
@@ -31,9 +31,9 @@
     },
     "packages/opencode": {
       "name": "@nicodes/reindr-opencode",
-      "version": "0.0.2",
+      "version": "0.0.3",
       "dependencies": {
-        "@nicodes/reindr-core": "^0.0.1",
+        "@nicodes/reindr-core": "^0.0.2",
         "@opencode-ai/plugin": "1.18.22",
       },
       "devDependencies": {

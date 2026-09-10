@@ -1,6 +1,6 @@
 {
   "name": "@nicodes/reindr-core",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Shared configuration and security primitives for Reindr integrations",
   "type": "module",
   "main": "./dist/index.js",

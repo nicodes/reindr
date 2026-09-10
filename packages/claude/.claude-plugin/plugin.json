@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin.json",
   "name": "reindr",
   "displayName": "Reindr",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Build and operate secure, live generative interfaces from Claude Code.",
   "author": {
     "name": "nicodes",

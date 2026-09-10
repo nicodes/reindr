@@ -12,3 +12,5 @@ Restart Claude Code after installation. Ask Claude to build an interface, or inv
 Browser interactions are delivered through the plugin monitor by default. Claude can instead wait for the next interaction with `reindr_wait`. The MCP server also implements Claude's research-preview channel contract; start Claude Code with `--dangerously-load-development-channels plugin:reindr@nicodes` and set `REINDR_CLAUDE_CHANNEL=1` to test direct channel injection.
 
 The plugin requires Node.js 20 or later. Its MCP runtime is bundled into the plugin artifact, so marketplace installation does not run a dependency installer or reference files outside the cached plugin directory.
+
+The local panel defaults to port `7676`, incrementing by one only when a port is occupied (`EADDRINUSE`), up to `65535` without wrapping. Set `REINDR_PORT` to choose an explicit port: occupied explicit ports report an error and never fall back. Explicit `0` asks the OS to assign a port. Invalid or empty values use the default policy; unrelated startup errors fail without retry.

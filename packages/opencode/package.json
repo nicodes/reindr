@@ -1,6 +1,6 @@
 {
   "name": "@nicodes/reindr-opencode",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Editable browser interfaces for OpenCode sessions",
   "type": "module",
   "main": "./dist/index.js",
@@ -21,7 +21,7 @@
     "prepack": "npm run build"
   },
   "dependencies": {
-    "@nicodes/reindr-core": "^0.0.1",
+    "@nicodes/reindr-core": "^0.0.2",
     "@opencode-ai/plugin": "1.18.22"
   },
   "devDependencies": {

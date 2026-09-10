@@ -1,6 +1,6 @@
 {
   "name": "@nicodes/reindr-claude-workspace",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "private": true,
   "description": "Claude Code plugin for Reindr generative interfaces",
   "type": "module",
