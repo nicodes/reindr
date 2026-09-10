@@ -4,10 +4,70 @@ import os from "node:os"
 import path from "node:path"
 import readline from "node:readline"
 import { spawn } from "node:child_process"
+import { once } from "node:events"
+import { createServer, type AddressInfo } from "node:net"
 import test from "node:test"
 import { chromium } from "playwright-core"
+import { Client } from "@modelcontextprotocol/sdk/client/index.js"
+import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 
 const chromiumExecutablePath = process.env.CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium"
+
+test("Claude MCP uses sequential defaults, rejects occupied explicit ports, and supports zero", { timeout: 20_000 }, async t => {
+  const held = []
+  for (const port of [7676, 7677, 0]) {
+    const server = createServer()
+    server.listen(port, "127.0.0.1")
+    await once(server, "listening")
+    held.push(server)
+    t.after(() => new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())))
+  }
+  const customPort = (held[2].address() as AddressInfo).port
+  for (const scenario of [
+    { name: "default occupied twice", configured: undefined, expected: 7678 },
+    { name: "explicit default occupied", configured: "7676", error: 7676 },
+    { name: "explicit custom occupied", configured: String(customPort), error: customPort },
+    { name: "OS assigned", configured: "0" },
+  ]) await t.test(scenario.name, async t => {
+    const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "reindr-claude-port-"))
+    const env = Object.fromEntries(Object.entries(process.env).filter((entry): entry is [string, string] => entry[1] !== undefined))
+    delete env.REINDR_PORT
+    delete env.REINDR_DIRECTORY
+    delete env.REINDR_TEMPLATE_DIRECTORY
+    if (scenario.configured !== undefined) env.REINDR_PORT = scenario.configured
+    const transport = new StdioClientTransport({
+      command: process.execPath,
+      args: [path.resolve("packages/claude/dist/server.mjs")],
+      env: { ...env, REINDR_PLUGIN_ROOT: path.resolve("packages/claude"), REINDR_DATA_DIRECTORY: temporaryDirectory, REINDR_AUTORAISE: "0" },
+      stderr: "pipe",
+    })
+    const client = new Client({ name: "reindr-port-test", version: "1.0.0" })
+    t.after(async () => {
+      await client.close()
+      await rm(temporaryDirectory, { recursive: true, force: true })
+    })
+    const errors: string[] = []
+    transport.stderr?.on("data", chunk => errors.push(String(chunk)))
+    await client.connect(transport)
+    for (const name of ["reindr_open", "reindr_status"]) {
+      const result = await client.callTool({ name, arguments: {} }, undefined, { timeout: 2_000 })
+      const text = (result.content as { text: string }[])[0].text
+      if (scenario.error) {
+        assert.equal(result.isError, true)
+        assert.match(text, new RegExp(`port ${scenario.error} is already in use.*explicit ports are never retried`))
+        assert.doesNotMatch(text, /http:\/\//)
+      } else {
+        assert.notEqual(result.isError, true)
+        const url = new URL(JSON.parse(text).panelUrl)
+        if (scenario.expected) assert.equal(Number(url.port), scenario.expected)
+        else assert.ok(Number(url.port) > 0)
+        assert.equal((await fetch(url)).status, 200)
+      }
+    }
+    if (scenario.error) assert.match(errors.join(""), /Reindr panel server failed to start/)
+    else assert.deepEqual(errors, [])
+  })
+})
 
 test("Claude MCP opens a sandboxed panel and receives only trusted interactions", async t => {
   const temporaryDirectory = await mkdtemp(path.join(os.tmpdir(), "reindr-claude-test-"))

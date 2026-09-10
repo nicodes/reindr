@@ -2509,12 +2509,16 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       },
     })
 
-    try {
-      panelServer = create(config.preferredPort)
-    } catch (error) {
-      if (config.preferredPort === 0) throw error
-      log("warn", `port ${config.preferredPort} is unavailable; selecting a fallback port`, { error: String(error) })
-      panelServer = create(0)
+    for (let port = config.preferredPort; ; port++) {
+      try {
+        panelServer = create(port)
+        break
+      } catch (error) {
+        if (recordValue(error)?.code !== "EADDRINUSE") throw error
+        if (config.portExplicit || port === 65_535) {
+          throw new Error(`Reindr port ${port} is already in use (EADDRINUSE); ${config.portExplicit ? "explicit ports are never retried" : "no free port remains through 65535"}.`)
+        }
+      }
     }
     panelOrigin = `http://127.0.0.1:${panelServer.port}`
     log("info", `UI panel listening on ${panelOrigin}`)
