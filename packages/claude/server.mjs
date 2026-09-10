@@ -250,17 +250,27 @@ const httpServer = createServer(async (request, response) => {
 httpServer.maxHeadersCount = 50
 httpServer.requestTimeout = 10_000
 httpServer.headersTimeout = 10_000
-httpServer.listen(config.preferredPort, "127.0.0.1", () => {
-  const address = httpServer.address()
-  panelUrl = `http://127.0.0.1:${address.port}/?token=${panelToken}`
+const panelReady = new Promise((resolve, reject) => {
+  let port = config.preferredPort
+  httpServer.once("listening", () => {
+    const address = httpServer.address()
+    panelUrl = `http://127.0.0.1:${address.port}/?token=${panelToken}`
+    resolve(panelUrl)
+  })
+  httpServer.on("error", error => {
+    if (error.code === "EADDRINUSE") {
+      if (!config.portExplicit && port < 65_535) {
+        httpServer.listen(++port, "127.0.0.1")
+        return
+      }
+      error = new Error(`Reindr port ${port} is already in use (EADDRINUSE); ${config.portExplicit ? "explicit ports are never retried" : "no free port remains through 65535"}.`)
+    }
+    reject(error)
+  })
+  httpServer.listen(port, "127.0.0.1")
 })
-httpServer.on("error", error => {
-  if (error.code === "EADDRINUSE" && config.preferredPort !== 0) {
-    httpServer.listen(0, "127.0.0.1")
-    return
-  }
-  console.error(error)
-})
+// Observe startup failures even before the first tool call awaits the panel.
+panelReady.catch(error => console.error("Reindr panel server failed to start:", error))
 
 function openBrowser(url) {
   if (openedBrowser || !config.autoOpen) return
@@ -283,21 +293,11 @@ function openBrowser(url) {
 }
 
 async function waitForPanelUrl() {
-  if (panelUrl) return panelUrl
-  await new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error("Panel server did not start")), 5_000)
-    const check = setInterval(() => {
-      if (!panelUrl) return
-      clearInterval(check)
-      clearTimeout(timeout)
-      resolve()
-    }, 10)
-  })
-  return panelUrl
+  return panelReady
 }
 
 const mcp = new Server(
-  { name: "reindr", version: "0.0.1" },
+  { name: "reindr", version: "0.0.2" },
   {
     capabilities: {
       tools: {},

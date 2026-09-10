@@ -1,6 +1,6 @@
 import { homedir } from "node:os";
 import path from "node:path";
-export const REINDR_DEFAULT_PORT = 4917;
+export const REINDR_DEFAULT_PORT = 7676;
 export function booleanOption(value, fallback) {
     if (typeof value === "boolean")
         return value;
@@ -55,8 +55,10 @@ export function resolveReindrConfig(worktree, options = {}, environment = proces
         : typeof options.templateDirectory === "string"
             ? options.templateDirectory
             : path.join(path.dirname(canvasDirectory), "templates");
+    const configuredPort = portOption(environment.REINDR_PORT ?? options.port, NaN);
     return {
-        preferredPort: portOption(environment.REINDR_PORT ?? options.port, REINDR_DEFAULT_PORT),
+        preferredPort: Number.isNaN(configuredPort) ? REINDR_DEFAULT_PORT : configuredPort,
+        portExplicit: !Number.isNaN(configuredPort),
         autoOpen: booleanOption(environment.REINDR_AUTORAISE ?? options.autoOpen, true),
         browserCommand: typeof environment.REINDR_BROWSER === "string"
             ? environment.REINDR_BROWSER
