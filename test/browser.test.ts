@@ -4,7 +4,7 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import test from "node:test"
 import { chromium } from "playwright-core"
-import plugin from "../.opencode/plugins/reindr.ts"
+import plugin from "../packages/opencode/src/index.ts"
 import { fakeClient, freePort, installBunServeAdapter, waitForHTTP } from "./harness.ts"
 
 const chromiumExecutablePath = process.env.CHROMIUM_EXECUTABLE_PATH || "/usr/bin/chromium"
@@ -108,7 +108,7 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   })
 
   const environment = await sessionEnvironment(hooks, "browser-session")
-  await openReindr(hooks, "browser-session")
+  await openReindr(hooks, "browser-session", "opencode-controller.html")
 
   const otherEnvironment = await sessionEnvironment(hooks, "second-session")
   await writeFile(otherEnvironment.REINDR_UI_FILE, "<main>Second session content</main>")
@@ -180,13 +180,12 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   assert.equal(await page.locator(".card, .bar, .rail").count(), 0, "the shell adds no content chrome")
   assert.equal(await page.locator("#status, #dot").count(), 0, "the header has no connection status chrome")
   const viewBounds = await page.locator(".agent-view").boundingBox()
-  assert.equal(viewBounds?.x, 0)
-  assert.equal(viewBounds?.width, 1000)
+  assert.equal(viewBounds?.x, 560)
+  assert.equal(viewBounds?.width, 440)
   const iframeBounds = await page.locator('iframe[title="Session browser-session"]').boundingBox()
-  assert.ok((iframeBounds?.height ?? 0) >= 752, "the UI fills the region beneath the header")
+  assert.ok((iframeBounds?.height ?? 0) >= 752, "the UI fills the region immediately beneath the header")
 
   const sessionToggle = page.locator("#session-toggle")
-  await sessionToggle.click()
   const drawer = page.locator("#session-drawer")
   await drawer.waitFor()
   assert.equal(await drawer.getByRole("link").count(), 2, "the panel lists every active Reindr session")
@@ -203,13 +202,13 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   const nameInput = frame.locator('input[name="name"]')
   await nameInput.fill("PreservedByReload")
   await nameInput.focus()
-  await page.evaluate(() => scrollTo(0, 280))
-  assert.ok(await page.evaluate(() => scrollY >= 250))
+  await page.locator("#canvas-workspace").evaluate((element) => element.scrollTo(0, 280))
+  assert.ok(await page.locator("#canvas-workspace").evaluate((element) => element.scrollTop >= 250))
   await writeFile(environment.REINDR_UI_FILE, canvasHTML("Updated summary"))
   await frame.getByText("Updated summary").waitFor()
   assert.equal(await frame.locator('input[name="name"]').inputValue(), "PreservedByReload", "form state survives a whole-file update")
   assert.equal(await frame.locator('input[name="name"]').evaluate((element) => document.activeElement === element), true, "focus survives a whole-file update")
-  await page.waitForFunction(() => scrollY >= 250)
+  await page.waitForFunction(() => document.getElementById("canvas-workspace")!.scrollTop >= 250)
 
   await frame.getByRole("button", { name: "Submit" }).click()
   await new Promise((resolve) => setTimeout(resolve, 100))
@@ -244,12 +243,10 @@ test("Chromium live-reloads a sandboxed session UI and sends activated interacti
   const restoredEnvironment = await sessionEnvironment(hooks, "browser-session")
   const restoredPage = await browser.newPage()
   await restoredPage.goto(restoredEnvironment.REINDR_UI_URL)
-  await restoredPage.getByRole("button", { name: "Activate saved content" }).waitFor()
-  assert.equal(await restoredPage.locator("iframe").count(), 0, "restored scripts do not run before activation")
-  await restoredPage.getByRole("button", { name: "Activate saved content" }).click()
   await restoredPage.locator('iframe[title="Session browser-session"]').waitFor({ state: "attached" })
   const restoredFrame = restoredPage.frameLocator('iframe[title="Session browser-session"]')
-  assert.equal(await restoredFrame.getByText("Updated summary").count(), 1)
+  await restoredFrame.getByText("Updated summary").waitFor()
+  assert.equal(await restoredPage.getByRole("button", { name: "Activate saved content" }).count(), 0)
   await restoredPage.close()
 })
 
@@ -277,11 +274,13 @@ test("OpenCode controller template drives and visualizes its session", async (t)
   })
 
   const environment = await sessionEnvironment(hooks, "controller-session")
-  await openReindr(hooks, "controller-session")
+  await openReindr(hooks, "controller-session", "opencode-controller.html")
   const page = await browser.newPage({ viewport: { width: 1200, height: 850 } })
   const pageErrors: string[] = []
   page.on("pageerror", (error) => pageErrors.push(error.message))
   await page.goto(environment.REINDR_UI_URL)
+  await page.locator("#agent-toggle").click()
+  await page.locator("#session-toggle").click()
   const frame = page.frameLocator('iframe[title="Session controller-session"]')
   await frame.locator("#session-title").getByText("Session controller-session").waitFor({ timeout: 5_000 }).catch(async (error) => {
     throw new Error(`${String(error)}\nPage errors: ${pageErrors.join(" | ")}\nFrame body: ${await frame.locator("body").innerText()}`)
@@ -385,7 +384,7 @@ test("Chromium switches between plugin processes in one tab", async (t) => {
   const rootURL = new URL("/", firstEnvironment.REINDR_UI_URL)
   rootURL.search = new URL(firstEnvironment.REINDR_UI_URL).search
   await waitingPage.goto(rootURL.href)
-  await waitingPage.getByText("Waiting for a session UI file.").waitFor()
+  await waitingPage.getByText("No canvases yet. Ask the agent to create a named canvas with reindr_open.").waitFor()
   await writeFile(firstEnvironment.REINDR_UI_FILE, "<main>First process UI</main>")
   await notifyFileEdit(firstHooks, "cross-port-a")
   await waitingPage.waitForURL((url) => url.pathname === new URL(firstEnvironment.REINDR_UI_URL).pathname)
@@ -394,9 +393,9 @@ test("Chromium switches between plugin processes in one tab", async (t) => {
   const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
   await page.goto(firstEnvironment.REINDR_UI_URL)
   assert.equal(new URL(page.url()).searchParams.has("token"), false)
-  await page.locator("#session-toggle").click()
   const drawer = page.locator("#session-drawer")
-  assert.equal(await drawer.getByRole("link").count(), 1)
+  await drawer.getByRole("link").nth(1).waitFor()
+  assert.equal(await drawer.getByRole("link").count(), 2, "sessions are navigable before they have canvases")
   const firstPageURL = page.url()
   await writeFile(secondEnvironment.REINDR_UI_FILE, `<main>Second process UI <button id="send">Send</button></main><script>document.getElementById("send").addEventListener("click", function () { opencode.submit({ prompt: "Second process interaction" }); });</script>`)
   await notifyFileEdit(secondHooks, "cross-port-b")
@@ -420,12 +419,10 @@ test("Chromium switches between plugin processes in one tab", async (t) => {
   assert.equal(secondFake.prompts.length, 1)
   assert.match(secondFake.prompts[0].body.parts[0].text, /Second process interaction/)
 
-  await page.locator("#session-toggle").click()
   await page.locator("#session-drawer").getByRole("link", { name: /Session cross-port-a/ }).click()
   await page.waitForURL((url) => url.origin === new URL(firstEnvironment.REINDR_UI_URL).origin)
   await page.locator('iframe[title="Session cross-port-a"]').waitFor({ state: "attached" })
   assert.equal(new URL(page.url()).searchParams.has("token"), false, "return navigation cleans the original process token")
-  await page.locator("#session-toggle").click()
   const firstDrawer = page.locator("#session-drawer")
   await firstDrawer.getByRole("link").nth(1).waitFor()
   const stableURL = page.url()
