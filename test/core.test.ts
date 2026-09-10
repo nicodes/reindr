@@ -4,7 +4,7 @@ import { request } from "node:http"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import test from "node:test"
-import plugin from "../.opencode/plugins/reindr.ts"
+import plugin from "../packages/opencode/src/index.ts"
 import { fakeClient, freePort, installBunServeAdapter, nextMessage, openSocket, waitForHTTP } from "./harness.ts"
 
 async function sessionEnvironment(hooks: Awaited<ReturnType<typeof plugin>>, sessionID: string) {
@@ -69,13 +69,13 @@ test("file-backed session routing, interaction delivery, and HTTP security", asy
     { sessionID: "session-a", agent: "build", messageID: "message-a" },
     { message: {} as never, parts: [] },
   )
-  const opened = await openReindr(hooks, "session-a")
+  const opened = await openReindr(hooks, "session-a", "opencode-controller.html")
   assert.equal(typeof opened, "object")
   const shippedController = await readFile(path.join(process.cwd(), "packages", "opencode", "assets", "opencode-controller.html"), "utf8")
   assert.match(await readFile(firstEnvironment.REINDR_UI_FILE, "utf8"), /OpenCode controller[\s\S]*opencode\.controller/)
   await writeFile(firstEnvironment.REINDR_UI_FILE, shippedController.trimEnd())
   await notifyFileEdit(hooks, "session-a")
-  assert.equal(await readFile(firstEnvironment.REINDR_UI_FILE, "utf8"), shippedController, "the shipped controller without its final newline is migrated")
+  assert.equal(await readFile(firstEnvironment.REINDR_UI_FILE, "utf8"), shippedController.trimEnd(), "even recognized legacy canvas HTML is never rewritten")
   const authoredHTML = `<!doctype html><html><head><style>main { display: grid; }</style></head><body><main><button>Apply</button><p>Ready</p></main></body></html>`
   await writeFile(firstEnvironment.REINDR_UI_FILE, authoredHTML)
   const reopened = await openReindr(hooks, "session-a")

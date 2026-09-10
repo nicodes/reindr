@@ -4,6 +4,7 @@ import { spawn } from "node:child_process"
 import { chmod, mkdir, open, readdir, realpath, rename, rm, writeFile, type FileHandle } from "node:fs/promises"
 import path from "node:path"
 import { tool, type Plugin } from "@opencode-ai/plugin"
+import { sidecarHTML, sidecarCSS, sidecarScript } from "./sidecar.js"
 import {
   canvasFileName,
   escapeHTML,
@@ -17,6 +18,8 @@ import {
 } from "@nicodes/reindr-core"
 
 type Canvas = {
+  canvasID: string
+  title: string
   sessionID: string
   sessionTitle: string
   agent?: string
@@ -73,21 +76,23 @@ type PanelServer = {
 
 type ClientCanvas = Omit<Canvas, "html" | "trustedController"> & {
   frameURL: string
+  controllerEnabled: boolean
 }
 
 type ServerMessage =
   | { type: "init"; canvases: ClientCanvas[]; sessions: SessionSummary[] }
   | { type: "sessions"; sessions: SessionSummary[] }
-  | { type: "session-canvas"; sessionID: string; canvas: ClientCanvas | null }
+  | { type: "session-canvas"; sessionID: string; canvasID: string; canvas: ClientCanvas | null }
   | { type: "session-remove"; sessionID: string }
+  | { type: "canvas-open"; sessionID: string; canvasID: string }
   | { type: "submission-status"; id: string; status: "queued" | "sent" | "failed"; message: string }
   | { type: "controller-result"; id: string; ok: true; value: unknown }
   | { type: "controller-result"; id: string; ok: false; error: string }
   | { type: "notice"; level: "info" | "error"; message: string }
 
 type ClientMessage =
-  | { type: "submit"; prompt: string; data?: unknown }
-  | { type: "controller"; id: string; action: "snapshot" | "prompt" | "command" | "abort"; payload?: unknown }
+  | { type: "submit"; canvasID?: string; prompt: string; data?: unknown }
+  | { type: "controller" | "host-controller"; canvasID?: string; id: string; action: "snapshot" | "prompt" | "command" | "abort"; payload?: unknown }
 
 type PermissionAction = "ask" | "allow" | "deny"
 type RuntimePermission = {
@@ -96,11 +101,15 @@ type RuntimePermission = {
 }
 
 const MAX_CANVAS_HTML_BYTES = 1_000_000
+const BLANK_CANVAS = '<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>Canvas</title></head><body></body></html>'
+const validCanvasID = (id: string) => /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/.test(id)
+const canvasKey = (sessionID: string, canvasID = "default") => JSON.stringify([sessionID, canvasID])
 const MAX_TEMPLATE_BYTES = 200_000
 const MAX_STYLESHEET_BYTES = 200_000
 const MAX_DATA_BYTES = 64_000
 const MAX_CONTROLLER_RESPONSE_BYTES = 1_000_000
 const MAX_CONTROLLER_HISTORY_BYTES = 650_000
+const MAX_CONTROLLER_PROVIDERS_BYTES = 250_000
 const MAX_CONTROLLER_MESSAGE_BYTES = 200_000
 const MAX_PENDING_SUBMISSIONS = 100
 const MAX_TEMPLATE_FRAME_CAPABILITIES = 100
@@ -184,6 +193,19 @@ function sdkData<T>(response: unknown): T {
     return (response as { data: T }).data
   }
   return response as T
+}
+
+function sessionStatusMap(value: unknown): Record<string, { type: "idle" | "busy" | "retry" }> | null {
+  const map = recordValue(value)
+  if (!map || Array.isArray(map) || ![Object.prototype, null].includes(Object.getPrototypeOf(map))) return null
+  if (Object.values(map).some((entry) => !entry || Array.isArray(entry) || !["idle", "busy", "retry"].includes(entry.type))) return null
+  return map
+}
+
+function statusForSession(map: ReturnType<typeof sessionStatusMap>, sessionID: string) {
+  if (!map) return { type: "unknown" as const }
+  // OpenCode omits idle sessions from a successful status map.
+  return Object.prototype.hasOwnProperty.call(map, sessionID) ? map[sessionID] : { type: "idle" as const }
 }
 
 function jsonText(value: unknown, limit = 12_000) {
@@ -286,6 +308,36 @@ function controllerMessage(value: unknown) {
     error: limitedText(errorData?.message ?? error?.name, 2_000),
     parts,
   }
+}
+
+function controllerProviders(providers: any[], current?: { providerID: string; modelID: string }) {
+  // Bound the wire catalog, not the catalog used to validate selections. Reserve
+  // the current model and provider defaults before filling remaining model slots.
+  let bytes = 2
+  const entries: { source: any; provider: any; included: Set<string> }[] = []
+  const ordered = providers.toSorted((a, b) => Number(b.id === current?.providerID) - Number(a.id === current?.providerID))
+  const addModel = (entry: typeof entries[number], model: any) => {
+    if (entry.included.has(model.id)) return
+    const size = jsonBytes(model) + 1
+    if (bytes + size > MAX_CONTROLLER_PROVIDERS_BYTES) return
+    entry.provider.models.push(model)
+    entry.included.add(model.id)
+    bytes += size
+  }
+  for (const source of ordered) {
+    const provider = { ...source, models: [] }
+    const size = jsonBytes(provider) + 1
+    if (bytes + size > MAX_CONTROLLER_PROVIDERS_BYTES) continue
+    bytes += size
+    const entry = { source, provider, included: new Set<string>() }
+    entries.push(entry)
+    const currentModel = current && source.id === current.providerID ? source.models.find((model: any) => model.id === current.modelID) : undefined
+    const defaultModel = source.models.find((model: any) => model.id === source.defaultModel)
+    if (currentModel) addModel(entry, currentModel)
+    if (defaultModel) addModel(entry, defaultModel)
+  }
+  for (const entry of entries) for (const model of entry.source.models) addModel(entry, model)
+  return entries.map((entry) => entry.provider)
 }
 
 const FALLBACK_LOADING_TEMPLATE = `<!doctype html>
@@ -913,14 +965,12 @@ ${FAVICON_LINK}
   .empty { display: grid; min-height: calc(100dvh - 48px); place-items: center; padding: 24px; color: var(--muted); text-align: center; }
   .agent-view { width: 100%; overflow: hidden; background: transparent; }
   iframe { display: block; width: 100%; height: 240px; min-height: calc(100dvh - 48px); border: 0; background: transparent; }
-  .dormant { display: grid; place-items: center; min-height: calc(100dvh - 48px); padding: 24px; text-align: center; background: var(--bg); }
-  .dormant p { max-width: 520px; margin: 0 0 14px; color: var(--muted); }
   button { padding: 8px 13px; color: var(--ink); background: var(--raised); border: 1px solid var(--edge); border-radius: 8px; cursor: pointer; }
   button:hover { background: var(--hover); border-color: #343434; }
   button:focus-visible { border-color: #555; outline: 2px solid #ffffff24; outline-offset: 2px; }
-  #session-toggle { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; padding: 0; color: #85858b; background: transparent; border-color: transparent; }
-  #session-toggle svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.55; }
-  #session-toggle:hover, #session-toggle:focus-visible, #session-toggle[aria-expanded="true"] { color: var(--ink); background: var(--raised); border-color: var(--edge); }
+  :is(#session-toggle, #agent-toggle) { display: grid; width: 34px; height: 34px; flex: 0 0 34px; place-items: center; padding: 0; color: #85858b; background: transparent; border-color: transparent; }
+  :is(#session-toggle, #agent-toggle) svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-linecap: round; stroke-linejoin: round; stroke-width: 1.55; }
+  :is(#session-toggle, #agent-toggle):is(:hover, :focus-visible, [aria-expanded="true"]) { color: var(--ink); background: var(--raised); border-color: var(--edge); }
   #drawer-backdrop { position: fixed; inset: 48px 0 0; z-index: 19; background: #000b; opacity: 0; pointer-events: none; transition: opacity .18s ease; backdrop-filter: blur(2px); }
   #drawer-backdrop.open { opacity: 1; pointer-events: auto; }
   #session-drawer { position: fixed; inset: 48px auto 0 0; z-index: 20; width: min(340px, 88vw); height: calc(100dvh - 48px); color: var(--ink); background: #090909f7; border-right: 1px solid #1f1f1f; box-shadow: 24px 0 70px #000c; transform: translateX(-100%); visibility: hidden; transition: transform .2s cubic-bezier(.22, 1, .36, 1), visibility 0s linear .2s; backdrop-filter: blur(20px); }
@@ -938,6 +988,7 @@ ${FAVICON_LINK}
   #toast.error { border-color: var(--bad); }
   @media (max-width: 520px) { header h1 { font-size: 12px; } }
   @media (prefers-reduced-motion: reduce) { #drawer-backdrop, #session-drawer, #toast { transition: none; } }
+  ${sidecarCSS}
 </style>
 </head>
 <body>
@@ -945,13 +996,20 @@ ${FAVICON_LINK}
   <button id="session-toggle" type="button" aria-label="Open sessions" title="Sessions" aria-controls="session-drawer" aria-expanded="false">
     <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="2.25" y="2.25" width="13.5" height="13.5" rx="2"></rect><path d="M6.25 2.5v13M9.25 6h3.5M9.25 9h3.5M9.25 12h2.25"></path></svg>
   </button>
+  <button id="agent-toggle" type="button" aria-label="Agent" title="Agent controls" aria-controls="agent-panel" aria-expanded="true">
+    <svg viewBox="0 0 18 18" aria-hidden="true"><rect x="3" y="5" width="12" height="10" rx="3"></rect><path d="M9 2v3M1 9v3M17 9v3M6 9h.01M12 9h.01M7 12h4"></path></svg>
+  </button>
   <h1>reindr</h1>
+  <div id="canvas-tabs" role="tablist" aria-label="Canvases"></div>
 </header>
-<main id="main"></main>
 <div id="drawer-backdrop"></div>
+<div id="workspace">
 <aside id="session-drawer" aria-hidden="true" aria-label="Sessions">
   <nav id="session-list" aria-label="OpenCode sessions"></nav>
 </aside>
+${sidecarHTML}
+<section id="canvas-workspace" aria-label="Canvas workspace"><main id="main"></main></section>
+</div>
 <div id="toast" role="status" aria-live="polite"></div>
 <script nonce="${nonce}">
 (function () {
@@ -959,6 +1017,13 @@ ${FAVICON_LINK}
   var match = location.pathname.match(/^\\/s\\/([^/]+)$/);
   var currentSession = match ? decodeURIComponent(match[1]) : null;
   var canvases = {};
+  var selectedCanvas = null;
+  var canvasStates = {};
+  var renderGeneration = 0;
+  var switchingTab = false;
+  var switchGeneration = 0;
+  var legacyRequests = new Map();
+  var legacySequence = 0;
   var sessions = [];
   var currentView = { iframe: null, frameURL: null, port: null, restoreState: null, pageScroll: null };
   var stateRequests = {};
@@ -972,6 +1037,31 @@ ${FAVICON_LINK}
   var drawerBackdrop = document.getElementById("drawer-backdrop");
   var sessionList = document.getElementById("session-list");
   var toast = document.getElementById("toast");
+  ${sidecarScript}
+
+  function localCanvases() { return Object.values(canvases).filter(function (canvas) { return canvas.sessionID === currentSession; }); }
+  function tabKey(canvas) { return JSON.stringify([canvas.sessionID, canvas.canvasID]); }
+  function selectTab(id) {
+    if (selectedCanvas === id) return;
+    var old = currentView.canvasID, generation = ++switchGeneration;
+    ++renderGeneration; switchingTab = true; selectedCanvas = id; renderTabs();
+    captureViewState(function (state) {
+      if (generation !== switchGeneration) return;
+      if (old) canvasStates[JSON.stringify([currentSession, old])] = state;
+      switchingTab = false; renderSession(false);
+    });
+  }
+  function renderTabs() {
+    var tabs = document.getElementById("canvas-tabs"); tabs.replaceChildren();
+    localCanvases().forEach(function (canvas) {
+      var button = document.createElement("button"); button.type = "button"; button.textContent = canvas.title;
+      button.setAttribute("role", "tab"); button.setAttribute("aria-selected", String(canvas.canvasID === selectedCanvas));
+      button.addEventListener("click", function () {
+        selectTab(canvas.canvasID);
+      });
+      tabs.append(button);
+    });
+  }
 
   function safeSend(message) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
@@ -1073,7 +1163,7 @@ ${FAVICON_LINK}
       if (currentView.pageScroll) {
         var savedScroll = currentView.pageScroll;
         currentView.pageScroll = null;
-        var restorePageScroll = function () { scrollTo(Number(savedScroll.x) || 0, Number(savedScroll.y) || 0); };
+        var restorePageScroll = function () { document.getElementById("canvas-workspace").scrollTo(Number(savedScroll.x) || 0, Number(savedScroll.y) || 0); };
         requestAnimationFrame(function () { restorePageScroll(); requestAnimationFrame(restorePageScroll); });
         setTimeout(restorePageScroll, 100);
       }
@@ -1082,10 +1172,15 @@ ${FAVICON_LINK}
     } else if (data.kind === "error") {
       notify(String(data.message || "UI interaction was blocked."), true);
     } else if (data.kind === "controller") {
+      var activeCanvas = localCanvases().find(function (canvas) { return canvas.canvasID === currentView.canvasID; });
+      if (!activeCanvas || !activeCanvas.controllerEnabled) return;
       var requestID = String(data.id || "");
       var action = String(data.action || "");
       if (!requestID || requestID.length > 100 || ["snapshot", "prompt", "command", "abort"].indexOf(action) < 0) return;
-      safeSend({ type: "controller", id: requestID, action: action, payload: data.payload });
+      var relayID = "frame:" + (++legacySequence);
+      legacyRequests.set(relayID, { id: requestID, port: currentView.port });
+      setTimeout(function () { legacyRequests.delete(relayID); }, 16000);
+      safeSend({ type: "controller", canvasID: currentView.canvasID, id: relayID, action: action, payload: data.payload });
     } else if (data.kind === "submit") {
       var prompt = String(data.prompt || "");
       if (!prompt || new TextEncoder().encode(prompt).length > 64000) {
@@ -1093,7 +1188,7 @@ ${FAVICON_LINK}
         return;
       }
       try {
-        var message = { type: "submit", prompt: prompt };
+        var message = { type: "submit", canvasID: currentView.canvasID, prompt: prompt };
         if (Object.prototype.hasOwnProperty.call(data, "data")) {
           var encoded = JSON.stringify(data.data);
           if (encoded === undefined || new TextEncoder().encode(encoded).length > 64000) throw new Error("invalid data");
@@ -1115,8 +1210,8 @@ ${FAVICON_LINK}
     var iframe = document.createElement("iframe");
     iframe.setAttribute("sandbox", "allow-scripts allow-forms");
     iframe.setAttribute("referrerpolicy", "no-referrer");
-    iframe.setAttribute("title", sessionTitle(canvas.sessionID));
-    currentView = { iframe: iframe, frameURL: canvas.frameURL, port: null, restoreState: state, pageScroll: pageScroll || null };
+    iframe.setAttribute("title", canvas.canvasID === "default" ? sessionTitle(canvas.sessionID) : canvas.title);
+    currentView = { canvasID: canvas.canvasID, iframe: iframe, frameURL: canvas.frameURL, port: null, restoreState: state, pageScroll: pageScroll || null };
     iframe.src = canvas.frameURL;
     view.appendChild(iframe);
     main.appendChild(view);
@@ -1137,38 +1232,29 @@ ${FAVICON_LINK}
   }
 
   function renderSession(preserveState) {
+    if (switchingTab) return;
+    var generation = ++renderGeneration;
     renderDrawer();
-    var canvas = canvases[currentSession];
+    var local = localCanvases();
+    if (!local.some(function (canvas) { return canvas.canvasID === selectedCanvas; })) selectedCanvas = local.length ? local[0].canvasID : null;
+    renderTabs();
+    var canvas = local.find(function (canvas) { return canvas.canvasID === selectedCanvas; });
     if (!canvas) {
       if (currentView.port) currentView.port.close();
       main.replaceChildren();
       currentView = { iframe: null, frameURL: null, port: null, restoreState: null, pageScroll: null };
       var empty = document.createElement("div");
       empty.className = "empty";
-      empty.textContent = "Waiting for this session's UI file.";
+      empty.textContent = "No canvases yet. Ask the agent to create a named canvas with reindr_open.";
       main.appendChild(empty);
       return;
     }
     if (currentView.iframe && currentView.frameURL === canvas.frameURL) return;
-    if (canvas.restored && !currentView.iframe) {
-      main.replaceChildren();
-      var dormant = document.createElement("div");
-      dormant.className = "dormant";
-      var content = document.createElement("div");
-      var text = document.createElement("p");
-      text.textContent = "This UI file was restored from disk. Its saved JavaScript will run only after you activate it.";
-      var button = document.createElement("button");
-      button.textContent = "Activate saved content";
-      button.addEventListener("click", function () { mountFrame(canvas, null, null); });
-      content.append(text, button);
-      dormant.appendChild(content);
-      main.appendChild(dormant);
-      return;
-    }
     if (preserveState && currentView.iframe) {
-      var pageScroll = { x: scrollX, y: scrollY };
-      captureViewState(function (state) { mountFrame(canvas, state, pageScroll); });
-    } else mountFrame(canvas, null, null);
+      var workspace = document.getElementById("canvas-workspace");
+      var pageScroll = { x: workspace.scrollLeft, y: workspace.scrollTop };
+      captureViewState(function (state) { if (generation === renderGeneration) mountFrame(canvas, state, pageScroll); });
+    } else mountFrame(canvas, canvasStates[tabKey(canvas)] || null, null);
   }
 
   function render() {
@@ -1177,6 +1263,7 @@ ${FAVICON_LINK}
   }
 
   sessionToggle.addEventListener("click", function () { setDrawer(sessionToggle.getAttribute("aria-expanded") !== "true"); });
+  setDrawer(true);
   drawerBackdrop.addEventListener("click", function () { setDrawer(false); });
   addEventListener("keydown", function (event) { if (event.key === "Escape" && sessionDrawer.classList.contains("open")) setDrawer(false); });
   addEventListener("message", function (event) {
@@ -1193,13 +1280,14 @@ ${FAVICON_LINK}
     var url = protocol + "//" + location.host + "/ws?token=" + encodeURIComponent(token);
     if (currentSession) url += "&session=" + encodeURIComponent(currentSession);
     ws = new WebSocket(url);
+    ws.onopen = refreshAgent;
     ws.onclose = function () { reconnectTimer = setTimeout(connect, 1500); };
     ws.onmessage = function (event) {
       var message;
       try { message = JSON.parse(event.data); } catch (_) { return; }
       if (message.type === "init") {
         canvases = {};
-        message.canvases.forEach(function (canvas) { canvases[canvas.sessionID] = canvas; });
+        message.canvases.forEach(function (canvas) { canvases[tabKey(canvas)] = canvas; });
         sessions = message.sessions;
         render();
       } else if (message.type === "sessions") {
@@ -1207,18 +1295,28 @@ ${FAVICON_LINK}
         if (currentSession) renderDrawer();
         else renderIndex();
       } else if (message.type === "session-canvas") {
-        if (message.canvas) canvases[message.sessionID] = message.canvas;
-        else delete canvases[message.sessionID];
+        var key = JSON.stringify([message.sessionID, message.canvasID]);
+        if (message.canvas) canvases[key] = message.canvas;
+        else { delete canvases[key]; delete canvasStates[key]; }
         if (message.sessionID === currentSession) renderSession(true);
         else renderDrawer();
+      } else if (message.type === "canvas-open") {
+        if (message.sessionID === currentSession) selectTab(message.canvasID);
       } else if (message.type === "session-remove") {
-        delete canvases[message.sessionID];
+        Object.keys(canvases).forEach(function (key) { if (canvases[key].sessionID === message.sessionID) delete canvases[key]; });
         if (message.sessionID === currentSession) renderSession(false);
         else renderDrawer();
       } else if (message.type === "submission-status") {
         notify(message.message, message.status === "failed");
       } else if (message.type === "controller-result") {
-        if (currentView.port) currentView.port.postMessage({ __ocwParent: 1, kind: "controller-result", id: message.id, ok: message.ok, value: message.value, error: message.error });
+        var request = hostRequests.get(message.id);
+        if (request) {
+          clearTimeout(request.timer); hostRequests.delete(message.id);
+          if (message.ok) request.resolve(message.value); else request.reject(new Error(message.error));
+        } else {
+          var relay = legacyRequests.get(message.id); legacyRequests.delete(message.id);
+          if (relay && relay.port === currentView.port) relay.port.postMessage({ __ocwParent: 1, kind: "controller-result", id: relay.id, ok: message.ok, value: message.value, error: message.error });
+        }
       } else if (message.type === "notice") {
         notify(message.message, message.level === "error");
       }
@@ -1255,8 +1353,9 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   const flushingSessions = new Set<string>()
   const sessionStatusGenerations = new Map<string, number>()
   const activeControllerRequests = new Set<string>()
-  const lastControllerSnapshots = new Map<string, number>()
+  const controllerSnapshots = new Map<string, { at: number; pending: boolean; promise: Promise<unknown> }>()
   const refreshGenerations = new Map<string, number>()
+  const openingCanvases = new Map<string, Promise<unknown>>()
   const retryTimers = new Set<ReturnType<typeof setTimeout>>()
 
   let panelServer: PanelServer | null = null
@@ -1295,7 +1394,12 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   ])
   const trustedControllerHash = createHash("sha256").update(defaultControllerTemplate).digest("hex")
 
-  const canvasFile = (sessionID: string) => path.join(config.canvasDirectory, canvasFileName(sessionID))
+  // Raw ! cannot occur in a legacy canvasFileName, so namespaces cannot collide.
+  const canvasPrefix = (sessionID: string) => `.canvas!${createHash("sha256").update(sessionID).digest("hex")}!`
+  const canvasFile = (sessionID: string, canvasID = "default") => {
+    if (!validCanvasID(canvasID)) throw new Error("Canvas identifier must be 1–64 letters, numbers, underscores or hyphens, starting with a letter or number.")
+    return path.join(config.canvasDirectory, canvasID === "default" ? canvasFileName(sessionID) : `${canvasPrefix(sessionID)}${canvasID}.html`)
+  }
 
   const sessionFrameKey = (sessionID: string) =>
     createHash("sha256").update("session-frame\0").update(sessionID).digest("base64url").slice(0, 24)
@@ -1324,13 +1428,16 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   }
 
   const canvasForClient = (canvas: Canvas): ClientCanvas => ({
+    controllerEnabled: canvas.trustedController,
+    canvasID: canvas.canvasID,
+    title: canvas.title,
     sessionID: canvas.sessionID,
     sessionTitle: canvas.sessionTitle,
     agent: canvas.agent,
     createdAt: canvas.createdAt,
     updatedAt: canvas.updatedAt,
     restored: canvas.restored,
-    frameURL: `${panelOrigin}/frame/${sessionFrameKey(canvas.sessionID)}?token=${encodeURIComponent(sessionFrameToken(canvas.sessionID))}&v=${createHash("sha256").update(canvas.html).digest("base64url").slice(0, 16)}`,
+    frameURL: `${panelOrigin}/frame/${sessionFrameKey(canvasKey(canvas.sessionID, canvas.canvasID))}?token=${encodeURIComponent(sessionFrameToken(canvasKey(canvas.sessionID, canvas.canvasID)))}&v=${createHash("sha256").update(canvas.html).digest("base64url").slice(0, 16)}`,
   })
 
   const send = (socket: PanelSocket, message: ServerMessage) => {
@@ -1347,9 +1454,9 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     for (const socket of sockets) send(socket, message)
   }
 
-  const broadcastCanvas = (sessionID: string) => {
-    const canvas = canvases.get(sessionID)
-    broadcast({ type: "session-canvas", sessionID, canvas: canvas ? canvasForClient(canvas) : null })
+  const broadcastCanvas = (sessionID: string, canvasID = "default") => {
+    const canvas = canvases.get(canvasKey(sessionID, canvasID))
+    broadcast({ type: "session-canvas", sessionID, canvasID, canvas: canvas ? canvasForClient(canvas) : null })
   }
 
   const broadcastSubmissionStatus = (submission: Submission, status: "queued" | "sent" | "failed", message: string) => {
@@ -1453,13 +1560,13 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     }
   }
 
-  const refreshCanvas = async (sessionID: string, restored: boolean) => {
+  const refreshCanvas = async (sessionID: string, restored: boolean, canvasID = "default") => {
     if (disposed) return false
-    const generation = (refreshGenerations.get(sessionID) ?? 0) + 1
-    refreshGenerations.set(sessionID, generation)
-    const isCurrent = () => !disposed && knownSessions.has(sessionID) && refreshGenerations.get(sessionID) === generation
-    const file = canvasFile(sessionID)
-    await migrateKnownBuiltInTemplate(file)
+    const key = canvasKey(sessionID, canvasID)
+    const generation = (refreshGenerations.get(key) ?? 0) + 1
+    refreshGenerations.set(key, generation)
+    const isCurrent = () => !disposed && knownSessions.has(sessionID) && refreshGenerations.get(key) === generation
+    const file = canvasFile(sessionID, canvasID)
     try {
       if (await realpath(config.canvasDirectory) !== realCanvasDirectory) throw new Error("UI directory changed after plugin startup")
       const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK)
@@ -1472,7 +1579,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       if (Buffer.byteLength(html, "utf8") > MAX_CANVAS_HTML_BYTES) throw new Error(`UI file exceeds ${MAX_CANVAS_HTML_BYTES} bytes`)
       if (!html.trim()) throw Object.assign(new Error("empty UI file"), { code: "ENOENT" })
       if (!isCurrent()) return false
-      const existing = canvases.get(sessionID)
+      const existing = canvases.get(key)
       if (existing?.html === html) {
         existing.agent = sessionAgents.get(sessionID) ?? existing.agent
         existing.sessionTitle = sessionTitles.get(sessionID) ?? existing.sessionTitle
@@ -1480,19 +1587,26 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       }
       const now = Date.now()
       const sessionTitle = await resolveSessionTitle(sessionID)
+      let title = existing?.title ?? (canvasID === "default" ? "Canvas" : canvasID)
+      try {
+        const metadata = JSON.parse(await readBoundedFile(`${file}.json`, 4096, "canvas metadata"))
+        if (typeof metadata.title === "string" && metadata.title.trim()) title = metadata.title.slice(0, 100)
+      } catch { /* Missing or invalid display metadata never prevents reading HTML. */ }
       if (!isCurrent()) return false
       const canvas: Canvas = {
+        canvasID,
+        title,
         sessionID,
         sessionTitle,
         agent: sessionAgents.get(sessionID) ?? existing?.agent,
         html,
-        trustedController: createHash("sha256").update(html).digest("hex") === trustedControllerHash,
+        trustedController: createHash("sha256").update(html).digest("hex") === trustedControllerHash || LEGACY_CONTROLLER_HASHES.has(createHash("sha256").update(html).digest("hex")),
         createdAt: existing?.createdAt ?? now,
         updatedAt: now,
-        restored,
+        restored: existing?.restored ?? restored,
       }
-      canvases.set(sessionID, canvas)
-      broadcastCanvas(sessionID)
+      canvases.set(key, canvas)
+      broadcastCanvas(sessionID, canvasID)
       broadcastSessions()
       await writeRegistry()
       if (!restored) {
@@ -1505,8 +1619,9 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       const code = error && typeof error === "object" && "code" in error ? error.code : null
       if (!isCurrent()) return false
       if (code === "ENOENT") {
-        if (canvases.delete(sessionID)) {
-          broadcastCanvas(sessionID)
+        if (canvases.delete(key)) {
+          sessionFrameTokens.delete(key)
+          broadcastCanvas(sessionID, canvasID)
           broadcastSessions()
           await writeRegistry()
         }
@@ -1520,10 +1635,26 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     }
   }
 
+  const refreshSession = async (sessionID: string, restored: boolean) => {
+    if (await realpath(config.canvasDirectory) !== realCanvasDirectory) throw new Error("UI directory changed after plugin startup")
+    const ids = new Set(["default", ...[...canvases.values()].filter((canvas) => canvas.sessionID === sessionID).map((canvas) => canvas.canvasID)])
+    for (const entry of await readdir(config.canvasDirectory, { withFileTypes: true })) {
+      if (!entry.name.startsWith(canvasPrefix(sessionID)) || !entry.name.endsWith(".html")) continue
+      const id = entry.name.slice(canvasPrefix(sessionID).length, -5)
+      if (validCanvasID(id)) ids.add(id)
+    }
+    await Promise.all([...ids].map((id) => refreshCanvas(sessionID, restored, id)))
+  }
+
   const registerSession = async (sessionID: string, restored: boolean) => {
     const firstRegistration = !knownSessions.has(sessionID)
     knownSessions.add(sessionID)
-    if (firstRegistration) await refreshCanvas(sessionID, restored)
+    if (firstRegistration) {
+      await resolveSessionTitle(sessionID)
+      await refreshSession(sessionID, restored)
+      broadcastSessions()
+      await writeRegistry()
+    }
   }
 
   const ensureTemplate = async (file: string, content: string) => {
@@ -1582,18 +1713,19 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     }
   }
 
-  const openSessionUI = async (sessionID: string, agent?: string, templateName = "opencode-controller.html") => {
+  const createSessionUI = async (sessionID: string, agent?: string, templateName?: string, canvasID = "default", title?: string) => {
+    const file = canvasFile(sessionID, canvasID)
     if (agent) sessionAgents.set(sessionID, agent)
     await registerSession(sessionID, false)
-    const file = canvasFile(sessionID)
     let created = false
     try {
       if (await realpath(config.canvasDirectory) !== realCanvasDirectory) throw new Error("UI directory changed after plugin startup")
       const handle = await open(file, constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW, 0o600)
       created = true
       try {
-        const [template, title] = await Promise.all([readSavedTemplate(templateName), resolveSessionTitle(sessionID)])
-        await handle.writeFile(renderLoadingTemplate(template, title), "utf8")
+        const [template, sessionTitle] = await Promise.all([templateName ? readSavedTemplate(templateName) : BLANK_CANVAS, resolveSessionTitle(sessionID)])
+        await ensureTemplate(`${file}.json`, JSON.stringify({ title: title?.trim().slice(0, 100) || (canvasID === "default" ? "Canvas" : canvasID) }))
+        await handle.writeFile(renderLoadingTemplate(template, sessionTitle), "utf8")
       } catch (error) {
         await rm(file, { force: true }).catch(() => {})
         throw error
@@ -1604,17 +1736,28 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       const code = error && typeof error === "object" && "code" in error ? error.code : null
       if (code !== "EEXIST") throw error
     }
-    await refreshCanvas(sessionID, false)
+    // Do not return an editable path that currently resolves to a symlink,
+    // non-regular file, or oversized document, even when O_EXCL saw EEXIST.
+    await readBoundedFile(file, MAX_CANVAS_HTML_BYTES, "UI file")
+    await refreshCanvas(sessionID, false, canvasID)
+    broadcast({ type: "canvas-open", sessionID, canvasID })
     const url = sessionURL(sessionID)
     if (url) await openBrowser(url)
-    return { created, file, url, template: templateName }
+    return { created, file, url, canvasID, template: templateName ?? "blank" }
+  }
+
+  const openSessionUI = async (sessionID: string, agent?: string, templateName?: string, canvasID = "default", title?: string) => {
+    const key = canvasKey(sessionID, canvasID)
+    const pending = (openingCanvases.get(key) ?? Promise.resolve()).catch(() => {}).then(() => createSessionUI(sessionID, agent, templateName, canvasID, title))
+    openingCanvases.set(key, pending)
+    try { return await pending } finally { if (openingCanvases.get(key) === pending) openingCanvases.delete(key) }
   }
 
   const scheduleRefresh = () => {
     if (refreshTimer) clearTimeout(refreshTimer)
     refreshTimer = setTimeout(() => {
       refreshTimer = null
-      for (const sessionID of knownSessions) void refreshCanvas(sessionID, false)
+      for (const sessionID of knownSessions) void refreshSession(sessionID, false).catch((error) => log("warn", "UI refresh failed", { error: String(error) }))
     }, 50)
   }
 
@@ -1638,7 +1781,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   }
 
   await Promise.all([
-    mkdir(config.canvasDirectory, { recursive: true }),
+    mkdir(config.canvasDirectory, { recursive: true, mode: 0o700 }),
     mkdir(config.templateDirectory, { recursive: true, mode: 0o700 }),
   ])
   await Promise.all([
@@ -1665,12 +1808,12 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   }
 
   const localSessionSummaries = (): SessionSummary[] =>
-    [...canvases.values()].map((canvas) => ({
-      key: `${instanceID}:${canvas.sessionID}`,
-      id: canvas.sessionID,
-      title: sessionTitles.get(canvas.sessionID) ?? canvas.sessionTitle,
-      url: sessionURL(canvas.sessionID) ?? "",
-      updatedAt: canvas.updatedAt,
+    [...knownSessions].map((sessionID) => ({
+      key: `${instanceID}:${sessionID}`,
+      id: sessionID,
+      title: sessionTitles.get(sessionID) ?? sessionID,
+      url: sessionURL(sessionID) ?? "",
+      updatedAt: Math.max(0, ...[...canvases.values()].filter((canvas) => canvas.sessionID === sessionID).map((canvas) => canvas.updatedAt)),
     })).filter((session) => session.url)
 
   const sessionsForClient = () => {
@@ -1855,15 +1998,17 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     const generation = sessionStatusGenerations.get(sessionID) ?? 0
     try {
       const response = await client.session.status()
-      const statuses = sdkData<Record<string, { type?: string }>>(response)
-      const status = statuses?.[sessionID]?.type
-      const normalized = status === "idle" ? "idle" : status ? "busy" : "unknown"
+      const statuses = sessionStatusMap(sdkData<unknown>(response))
+      const status = statusForSession(statuses, sessionID).type
+      const normalized = status === "busy" || status === "retry" ? "busy" : status
       if ((sessionStatusGenerations.get(sessionID) ?? 0) !== generation) return sessionStatus.get(sessionID) ?? "unknown"
       updateSessionStatus(sessionID, normalized)
       return sessionStatus.get(sessionID) ?? normalized
     } catch (error) {
       log("warn", "could not read session status", { sessionID, error: String(error) })
-      return sessionStatus.get(sessionID) ?? "unknown"
+      if ((sessionStatusGenerations.get(sessionID) ?? 0) !== generation) return sessionStatus.get(sessionID) ?? "unknown"
+      updateSessionStatus(sessionID, "unknown")
+      return "unknown"
     }
   }
 
@@ -1878,12 +2023,12 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       safe<any[]>(client.command.list(), []),
     ])
     const connected = new Set(Array.isArray(providerData?.connected) ? providerData.connected : [])
-    const providers = (Array.isArray(providerData?.all) ? providerData.all : []).slice(0, 20).map((provider: any) => ({
+    const providers = (Array.isArray(providerData?.all) ? providerData.all : []).filter((provider: any) => connected.has(provider?.id)).map((provider: any) => ({
       id: limitedText(provider?.id, 200),
       name: limitedText(provider?.name, 300),
       connected: connected.has(provider?.id),
       defaultModel: limitedText(providerData?.default?.[provider?.id], 300),
-      models: Object.values(recordValue(provider?.models) ?? {}).slice(0, 50).map((model: any) => ({
+      models: Object.values(recordValue(provider?.models) ?? {}).map((model: any) => ({
         id: limitedText(model?.id, 300),
         name: limitedText(model?.name, 300),
         reasoning: Boolean(model?.reasoning),
@@ -1896,7 +2041,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         },
       })).filter((model: any) => model.id),
     })).filter((provider: any) => provider.id)
-    const agents = agentData.slice(0, 100).map((agent: any) => ({
+    const agents = agentData.filter((agent: any) => !agent?.hidden).slice(0, 100).map((agent: any) => ({
       name: limitedText(agent?.name, 200),
       description: limitedText(agent?.description, 1_000),
       mode: limitedText(agent?.mode, 40),
@@ -1921,13 +2066,14 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     const safe = async <T>(request: Promise<unknown>, fallback: T): Promise<T> => {
       try { return sdkData<T>(await request) } catch { return fallback }
     }
-    const [session, messages, children, statuses, catalog] = await Promise.all([
+    const [session, messages, children, statusData, catalog] = await Promise.all([
       safe<any>(client.session.get({ path: { id: sessionID } }), { id: sessionID, title: sessionID }),
       safe<any[]>(client.session.messages({ path: { id: sessionID }, query: { limit: 100 } }), []),
       safe<any[]>(client.session.children({ path: { id: sessionID } }), []),
-      safe<Record<string, any>>(client.session.status(), {}),
+      safe<unknown>(client.session.status(), null),
       controllerCatalog(),
     ])
+    const statuses = sessionStatusMap(statusData)
     const normalizedMessages: ReturnType<typeof controllerMessage>[] = []
     let historyBytes = 0
     for (const message of messages.slice(-100).reverse()) {
@@ -1947,20 +2093,20 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         parentID: limitedText(session?.parentID, 200),
         time: session?.time,
       },
-      status: statuses?.[sessionID] ?? sessionStatus.get(sessionID) ?? { type: "unknown" },
+      status: statusForSession(statuses, sessionID),
       selection: {
         agent: sessionAgents.get(sessionID) ?? lastUser?.agent ?? "",
         model: lastUser?.model ?? { providerID: "", modelID: "" },
       },
       agents: catalog.agents,
-      providers: catalog.providers,
+      providers: controllerProviders(catalog.providers, lastUser?.model),
       commands: catalog.commands,
       children: children.slice(0, 200).map((child: any) => ({
         id: limitedText(child?.id, 200),
         title: limitedText(child?.title ?? child?.id, 500),
         parentID: limitedText(child?.parentID, 200),
         time: child?.time,
-        status: statuses?.[child?.id] ?? { type: "idle" },
+        status: statusForSession(statuses, child?.id),
       })),
       messages: normalizedMessages,
     }
@@ -1993,6 +2139,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   }
 
   const enqueueSubmission = (submission: Submission) => {
+    if (disposed || !knownSessions.has(submission.sessionID)) throw new Error("The owning session is no longer active.")
     const queuedCount = [...submissionQueues.values()].reduce((total, queue) => total + queue.length, 0)
     if (queuedCount >= MAX_PENDING_SUBMISSIONS) throw new Error("Too many interactions are waiting for an agent session.")
     const queue = submissionQueues.get(submission.sessionID) ?? []
@@ -2016,7 +2163,6 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   }
 
   const handleController = async (sessionID: string, action: "snapshot" | "prompt" | "command" | "abort", payloadValue: unknown) => {
-    if (!canvases.get(sessionID)?.trustedController) throw new Error("Controller access is limited to the unmodified built-in controller.")
     const payload = controllerPayload(payloadValue)
     if (action === "snapshot") return controllerSnapshot(sessionID)
     if (action === "prompt") {
@@ -2033,6 +2179,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       const argumentsText = limitedText(payload.arguments, MAX_DATA_BYTES)
       if (Buffer.byteLength(argumentsText, "utf8") > MAX_DATA_BYTES) throw new Error("Command arguments exceed 64 KB.")
       const { agent, model, catalog } = await controllerSelection(payload)
+      if (disposed || !knownSessions.has(sessionID)) throw new Error("The owning session is no longer active.")
       if (!command || !catalog.commands.some((item) => item.name === command)) throw new Error("Unknown OpenCode command.")
       if (flushingSessions.has(sessionID) || submissionQueues.get(sessionID)?.length) throw new Error("Wait for queued session interactions before running a command.")
       if (agent) sessionAgents.set(sessionID, agent)
@@ -2040,6 +2187,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       let dispatched = false
       try {
         if (await refreshSessionStatus(sessionID) !== "idle") throw new Error("The session must be idle before running a command.")
+        if (disposed || !knownSessions.has(sessionID)) throw new Error("The owning session is no longer active.")
         dispatched = true
         updateSessionStatus(sessionID, "busy")
         sdkData(await client.session.command({
@@ -2078,6 +2226,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       const cachedStatus = sessionStatus.get(sessionID)
       const status = !cachedStatus || cachedStatus === "unknown" ? await refreshSessionStatus(sessionID) : cachedStatus
       if (status !== "idle") return
+      if (disposed || !knownSessions.has(sessionID)) return
       submission = queue.shift()
       if (!submission) return
       if (!queue.length) submissionQueues.delete(sessionID)
@@ -2103,20 +2252,29 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   }
 
   const removeSession = async (sessionID: string) => {
-    refreshGenerations.set(sessionID, (refreshGenerations.get(sessionID) ?? 0) + 1)
+    const files = [...canvases.values()].filter((canvas) => canvas.sessionID === sessionID)
     knownSessions.delete(sessionID)
-    canvases.delete(sessionID)
+    for (const canvas of files) {
+      const key = canvasKey(sessionID, canvas.canvasID)
+      canvases.delete(key)
+      sessionFrameTokens.delete(key)
+      refreshGenerations.set(key, (refreshGenerations.get(key) ?? 0) + 1)
+    }
+    for (const socket of sockets) if (socket.data.sessionID === sessionID) socket.close(1001, "session deleted")
     submissionQueues.delete(sessionID)
     sessionStatus.delete(sessionID)
     sessionStatusGenerations.delete(sessionID)
     sessionAgents.delete(sessionID)
     sessionTitles.delete(sessionID)
-    sessionFrameTokens.delete(sessionID)
     activeControllerRequests.delete(sessionID)
-    lastControllerSnapshots.delete(sessionID)
+    controllerSnapshots.delete(sessionID)
     try {
       if (await realpath(config.canvasDirectory) !== realCanvasDirectory) throw new Error("UI directory changed after plugin startup")
       await rm(canvasFile(sessionID), { force: true })
+      for (const canvas of files) {
+        await rm(canvasFile(sessionID, canvas.canvasID), { force: true })
+        await rm(`${canvasFile(sessionID, canvas.canvasID)}.json`, { force: true })
+      }
     } catch (error) {
       log("warn", "failed to remove session UI file", { sessionID, file: canvasFile(sessionID), error: String(error) })
     }
@@ -2134,21 +2292,32 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     } catch {
       return
     }
-    if (!socket.data.sessionID) return
-    if (message?.type === "controller") {
+    if (!socket.data.sessionID || !knownSessions.has(socket.data.sessionID)) return
+    if (message?.type === "controller" || message?.type === "host-controller") {
       if (!message.id || message.id.length > 100 || !["snapshot", "prompt", "command", "abort"].includes(message.action)) return
       const sessionID = socket.data.sessionID
+      if (message.type === "controller" && !canvases.get(canvasKey(sessionID, message.canvasID))?.trustedController) {
+        send(socket, { type: "controller-result", id: message.id, ok: false, error: "Controller access is limited to the unmodified built-in controller." })
+        return
+      }
+      if (message.action === "snapshot") {
+        // Host and legacy controller share one bounded SDK read, not competing polls.
+        let cached = controllerSnapshots.get(sessionID)
+        if (!cached || !cached.pending && Date.now() - cached.at >= 250) {
+          const entry = { at: Date.now(), pending: true, promise: controllerSnapshot(sessionID) as Promise<unknown> }
+          entry.promise = entry.promise.finally(() => { entry.pending = false })
+          controllerSnapshots.set(sessionID, entry)
+          cached = entry
+        }
+        try { send(socket, { type: "controller-result", id: message.id, ok: true, value: await cached.promise }) }
+        catch (error) { send(socket, { type: "controller-result", id: message.id, ok: false, error: String(error) }) }
+        return
+      }
       if (activeControllerRequests.has(sessionID)) {
         send(socket, { type: "controller-result", id: message.id, ok: false, error: "Another controller request is still running." })
         return
       }
-      const now = Date.now()
-      if (message.action === "snapshot" && now - (lastControllerSnapshots.get(sessionID) ?? 0) < 250) {
-        send(socket, { type: "controller-result", id: message.id, ok: false, error: "Controller snapshots are limited to four requests per second." })
-        return
-      }
       activeControllerRequests.add(sessionID)
-      if (message.action === "snapshot") lastControllerSnapshots.set(sessionID, now)
       try {
         const value = await handleController(sessionID, message.action, message.payload)
         if (jsonBytes(value) > MAX_CONTROLLER_RESPONSE_BYTES) throw new Error("Controller response exceeds the response limit.")
@@ -2161,7 +2330,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
       return
     }
     if (message?.type !== "submit" || typeof message.prompt !== "string") return
-    const canvas = canvases.get(socket.data.sessionID)
+    const canvas = canvases.get(canvasKey(socket.data.sessionID, message.canvasID))
     if (!canvas || !message.prompt.trim() || Buffer.byteLength(message.prompt, "utf8") > MAX_DATA_BYTES) return
     const hasData = Object.prototype.hasOwnProperty.call(message, "data")
     if (hasData) {
@@ -2232,7 +2401,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         }
         if (url.pathname === "/ws") {
           const requestedSession = url.searchParams.get("session")
-          if (req.headers.get("origin") !== panelOrigin || url.searchParams.get("token") !== authToken || requestedSession && !canvases.has(requestedSession)) {
+          if (req.headers.get("origin") !== panelOrigin || url.searchParams.get("token") !== authToken || requestedSession && !knownSessions.has(requestedSession)) {
             return new Response("forbidden", { status: 403 })
           }
           return server.upgrade(req, { data: { sessionID: requestedSession } })
@@ -2309,7 +2478,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         if (sessionMatch) {
           let sessionID: string
           try { sessionID = decodeURIComponent(sessionMatch[1]) } catch { return landing(true) }
-          if (!canvases.has(sessionID)) return landing(true)
+          if (!knownSessions.has(sessionID)) return landing(true)
         }
         const html = shellHtml(shellNonce)
         const connectSource = panelOrigin ? `${panelOrigin.replace("http:", "ws:")} ${panelOrigin}` : "'self'"
@@ -2369,10 +2538,10 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
     const file = canvasFile(sessionID)
     const url = sessionURL(sessionID)
     return [
-      "This session has a browser UI canvas backed by one editable HTML file.",
-      `UI file: ${file}`,
+      "This session has a Reindr workspace with host-owned agent controls and multiple named HTML canvas tabs. It starts with no canvas files.",
+      `Legacy/default UI file (may not exist yet): ${file}`,
       url ? `Panel: ${url}` : `Panel unavailable: ${serveError ?? "server did not start"}`,
-      "When the user requests an interface, call reindr_open as your first action so the default OpenCode controller appears immediately, then edit the returned file with normal filesystem tools when a custom interface is needed. The reindr_open tool never overwrites existing content and is only a lifecycle tool; do not look for other UI rendering tools.",
+      "When the user requests an interface, call reindr_open first. Use { canvasID: 'stable-id', title: 'Display name', template?: 'saved.html' } to create or reopen a distinct tab, then edit its returned file. IDs are 1–64 letters/numbers/underscores/hyphens, beginning with a letter or number. Omit canvasID to use the legacy/default tab. New tabs are blank unless a template is specified; existing HTML and its original title are preserved. Reuse an ID to update that tab; use a different ID for separate content. Do not create controller HTML for agent controls: they are provided by the trusted host. This is only a lifecycle tool; do not look for other UI rendering tools.",
       "Keep the file's HTML, CSS, and JavaScript self-contained. The plugin detects changes and live-reloads the sandboxed panel.",
       "Generated JavaScript may call opencode.submit({ prompt, data? }) directly from a user click or form submission. The optional data value must be JSON-serializable. Use opencode.setHeight(px) only when automatic sizing is insufficient.",
       config.allowedAssetOrigins.length
@@ -2384,13 +2553,15 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
   return {
     tool: {
       reindr_open: tool({
-        description: "Open the Reindr panel immediately when the user requests an interface. New session UIs default to opencode-controller.html and can optionally use another saved HTML template. Existing session UI content is always preserved.",
+        description: "Create or reopen a named Reindr canvas tab and return its editable HTML file. New tabs are blank unless a saved template is specified. Existing HTML is never overwritten. Agent controls live in the host, not the canvas.",
         args: {
-          template: tool.schema.string().optional().describe("Saved template filename, for example reindr-loading.html. Defaults to opencode-controller.html."),
+          canvasID: tool.schema.string().optional().describe("Stable tab identifier: 1–64 letters/numbers/underscores/hyphens starting with a letter or number. Defaults to default (legacy file)."),
+          title: tool.schema.string().optional().describe("Initial display name (up to 100 characters); existing tab names are preserved."),
+          template: tool.schema.string().optional().describe("Optional saved HTML template filename. Omit for a blank canvas."),
         },
         async execute(args, context) {
           context.metadata({ title: "Opening Reindr" })
-          const result = await openSessionUI(context.sessionID, context.agent, args.template)
+          const result = await openSessionUI(context.sessionID, context.agent, args.template, args.canvasID, args.title)
           return {
             title: result.created ? "Opened Reindr" : "Reopened Reindr",
             output: [
@@ -2400,7 +2571,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
               result.url ? `Panel: ${result.url}` : `Panel unavailable: ${serveError ?? "server did not start"}`,
               "Edit the UI file now with normal filesystem tools to implement the user's request.",
             ].join("\n"),
-            metadata: { file: result.file, url: result.url, created: result.created, template: result.template },
+            metadata: { file: result.file, url: result.url, created: result.created, template: result.template, canvasID: result.canvasID },
           }
         },
       }),
@@ -2450,8 +2621,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
         const info = properties.info as { id?: string; title?: string } | undefined
         if (info?.id && info.title) {
           sessionTitles.set(info.id, info.title)
-          const canvas = canvases.get(info.id)
-          if (canvas) canvas.sessionTitle = info.title
+          for (const canvas of canvases.values()) if (canvas.sessionID === info.id) canvas.sessionTitle = info.title
           broadcastSessions()
           await writeRegistry()
         }
@@ -2472,8 +2642,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
 
     "chat.message": async (input) => {
       if (input.agent) sessionAgents.set(input.sessionID, input.agent)
-      const canvas = canvases.get(input.sessionID)
-      if (canvas && input.agent) canvas.agent = input.agent
+      for (const canvas of canvases.values()) if (canvas.sessionID === input.sessionID && input.agent) canvas.agent = input.agent
       await registerSession(input.sessionID, true)
     },
 
@@ -2493,7 +2662,7 @@ const ReindrPlugin: Plugin = async ({ client, worktree }, options) => {
 
     "tool.execute.after": async (input) => {
       await registerSession(input.sessionID, false)
-      await refreshCanvas(input.sessionID, false)
+      await refreshSession(input.sessionID, false)
     },
   }
 }
