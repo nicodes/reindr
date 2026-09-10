@@ -31,7 +31,7 @@
     },
     "packages/opencode": {
       "name": "@nicodes/reindr-opencode",
-      "version": "0.0.1",
+      "version": "0.0.2",
       "dependencies": {
         "@nicodes/reindr-core": "^0.0.1",
         "@opencode-ai/plugin": "1.18.22",
