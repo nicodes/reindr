@@ -8,17 +8,17 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build:core && npm run build:opencode && npm run build:claude",
+    "build": "python3 scripts/prepare-runtime.py && npm run build:core && npm run build:opencode && npm run build:claude",
     "build:core": "rm -rf packages/core/dist && tsc -p packages/core/tsconfig.build.json",
     "build:opencode": "rm -rf packages/opencode/dist && tailwindcss -i packages/opencode/assets/reindr-tailwind.input.css -o packages/opencode/assets/reindr-tailwind.css --minify && tsc -p packages/opencode/tsconfig.build.json",
     "build:claude": "node packages/claude/scripts/build.mjs",
     "typecheck": "npm run build:core && tsc -p packages/core/tsconfig.json --noEmit && tsc -p packages/opencode/tsconfig.json --noEmit && tsc --noEmit",
     "pretest": "npm run build",
-    "test": "node --import tsx --test --test-concurrency=1 test/*.test.ts",
+    "test": "python3 scripts/prepare-runtime.py && node --import tsx --test --test-concurrency=1 test/*.test.ts",
     "test:core": "node --import tsx --test test/core.test.ts",
     "test:browser": "node --import tsx --test test/browser.test.ts",
     "pack:check": "npm pack --workspace @nicodes/reindr-core --dry-run && npm pack --workspace @nicodes/reindr-opencode --dry-run",
-    "check": "npm run typecheck && npm test && npm run pack:check"
+    "check": "python3 scripts/prepare-runtime.py && npm run typecheck && npm test && npm run pack:check"
   },
   "devDependencies": {
     "@tailwindcss/cli": "^4.3.3",
