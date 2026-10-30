@@ -1,0 +1,6 @@
+[
+  {
+    "source": "packages/claude/skills/interface/SKILL.prompt",
+    "target": "packages/claude/skills/interface/SKILL.md"
+  }
+]

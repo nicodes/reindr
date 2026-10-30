@@ -4,3 +4,6 @@ dist/
 !packages/claude/dist/server.mjs
 artifacts/
 *.log
+
+# Native runtime files generated from functional inputs.
+/packages/claude/skills/interface/SKILL.md
