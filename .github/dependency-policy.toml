@@ -1,0 +1,8 @@
+version = 2
+mode = "merge-on-green"
+ci_workflow = "build-and-test.yml"
+required_checks = ["Build and test"]
+dispatch_workflow = "build-and-test.yml"
+max_group_size = 10
+managed_dependencies = []
+sensitive_dependencies = []
